@@ -1,7 +1,0 @@
-fastapi
-uvicorn
-aiohttp
-flask
-gunicorn
-curl_cffi
-requests
