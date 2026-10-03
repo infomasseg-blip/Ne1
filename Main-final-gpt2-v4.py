@@ -1039,20 +1039,6 @@ def parse_cc_string(cc_string):
         raise ValueError("Invalid CC format. CVV must contain digits.")
     return {'cc': parts[0].strip(), 'mes': parts[1].strip(), 'ano': parts[2].strip(), 'cvv': cvv_match.group(0)}
 
-# التحسين: دالة parse_cc_string محسّنة
-def parse_cc_string(cc_string):
-    parts = cc_string.split('|')
-    if len(parts) != 4:
-        raise ValueError("Invalid CC format. Use: CC|MM|YYYY|CVV")
-    cvv_match = re.search(r'\d+', parts[3])
-    if not cvv_match:
-        raise ValueError("Invalid CC format. CVV must contain digits.")
-    return {
-        'cc': parts[0].strip(),
-        'mes': parts[1].strip(),
-        'ano': parts[2].strip(),
-        'cvv': cvv_match.group(0)
-    }
 
 # ============================================================
 # _process_card_inner - Core checkout flow
