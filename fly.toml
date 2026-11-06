@@ -1,5 +1,5 @@
-app = "yo-api-yourname"
-primary_region = "cdg"   # باريس (قريبة من مصر/أوروبا) — أو "fra" فرانكفورت
+app = "yo-api-CHANGE-ME"
+primary_region = "cdg"
 
 [build]
   dockerfile = "Dockerfile"
@@ -11,12 +11,12 @@ primary_region = "cdg"   # باريس (قريبة من مصر/أوروبا) — 
 [http_service]
   internal_port = 8000
   force_https = true
-  auto_stop_machines = false      # ⭐ لا تُوقف الجهاز — ضروري للمهام الخلفية
+  auto_stop_machines = false
   auto_start_machines = true
-  min_machines_running = 1        # ⭐ أبقِ جهازًا واحدًا يعمل دائمًا
+  min_machines_running = 1
 
 [[vm]]
-  memory = "512mb"                # 256mb قد لا تكفي مع httpx + المهام الخلفية
+  memory = "512mb"
   cpu_kind = "shared"
   cpus = 1
 
