@@ -1,4 +1,4 @@
-app = "yo-api-CHANGE-ME"
+app = "main"
 primary_region = "cdg"
 
 [build]
