@@ -13,9 +13,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
-COPY main-yo-api.py .
+COPY main.py .
 
 EXPOSE 8000
 
-CMD ["uvicorn", "main-yo-api:app", "--host", "0.0.0.0", "--port", "8000", \
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", \
      "--proxy-headers", "--forwarded-allow-ips", "*"]
