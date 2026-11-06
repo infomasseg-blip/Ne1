@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # ═══════════════════════════════════════════════════════════════════════════
-# main-yo-api.py — Yomobile API Runner v1.7.0
-# ✅ كل القيم من السجل 11-04_02_20_39.log مضمّنة
-# ✅ مصر (EG) ثابتة — country_id + product_id جاهزة
-# ✅ Stripe pk فقط (لا sk) — Legacy /v1/tokens
-# ✅ جلسة تلقائية من auth_token + refresh_token + device_id
-# ✅ 3 استراتيجيات دفع: tok من pk → pm من السجل → wallet_sheet
+# main-yo-api.py — Yomobile API Runner v1.9.0
+# ✅ JWT-aware session refresh (no more 15-min expiry issues)
+# ✅ Proactive renewal + 401-retry + background refresh loop
+# ✅ 308 Redirect fix (trailing slash removal)
+# ✅ Egypt hardcoded, pk-only Stripe tokenization
 # ═══════════════════════════════════════════════════════════════════════════
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -44,27 +44,29 @@ if not logger.handlers:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ⚙️ CONFIG — كل القيم من السجل 11-04_02_20_39.log
+# ⚙️ CONFIG — التوكنات الجديدة مضمّنة من كوكيزك
 # ═══════════════════════════════════════════════════════════════════════════
 _FIXED_CONFIG = {
-    # ── 🔑 الجلسة (من Set-Cookie في السجل #73) ──────────────────────────
+    # ── 🔑 الجلسة (من كوكيز متصفحك) ──────────────────────────────────────
     "AUTH_TOKEN": (
         "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9."
-        "eyJpYXQiOjE3OTM3NTA5ODEsImV4cCI6MTc5Mzc1MTg4MSwic2Vzc2lvbl9pZCI6ImUxNWU0"
-        "NGMyLWJkMTItNGU1NS05NjA5LTRhNzhhYzAzOTQwOCIsInNhbHQiOiJxWGRSc205WCJ9."
-        "DfJu1xgjK_Zm3KrY6C50i2Zk2eA2ZwZWz53GEmZJfKQcdi7wm4FWsHZUxgcOjf5zTOtIGWxTH"
-        "8arCFMgSNfBL51P6QAmRQZjym6aWo-kBkXQKe0KU0jGxqS8U4F-Du4tW6Wgh2c3wCOWZ0KJHML"
-        "oY2VoqAiIbc93hQ2IWmfycbf8aaVbYQE8VdoOKQRdTkgBjGmFijLXkpLeTM26AioA_olqSdiNJR"
-        "ImcQfnh5Yq-yiW2KtnI-k0ip5bC_OUUKu0a1WrKrS2BetmNeAQBnyHCfoRiuvtEksGesPhkJuPd"
-        "RYIT6263KrRrdm_INU4efBEhTDMbbItbXftqilk1BLs_w"
+        "eyJpYXQiOjE3OTM5ODkwNzcsImV4cCI6MTc5Mzk4OTk3Nywic2Vzc2lvbl9pZCI6ImUxMzU0"
+        "Y2U3LWY5ODYtNGM1ZC1hYjk2LTg5ZWZmNGUzYTc1ZCIsInNhbHQiOiJCd1JLekdYaiJ9."
+        "gQIU3ZH5Yt2NYZhdEMd_NQ-_4oDV1SLRy4Czx4eQ9yl1D9fBHci6-4fi9a7PjEKBLW0YtoCQ"
+        "GzGk92wHBG1pd2HUXZPRxnLRU10pdNd9BT2XmLZ9PTRAO-FB24ZkIId-Hmu3qnTp11ZrnNt1s"
+        "BZPC3VQg5H-yCzJ72ZF3NmYk7rm1RIT6y62beOZ_q9KAoXzb5A-em1d9uud1ptMZD_dy8X5YO"
+        "RjW9V_gInN8542oVz4EHVFiCT3ua5kjrHbJW9o9Hhowp_f6floOkUY9KSvJeu6TUOnzLBiRUZ"
+        "JLOeu_jqW6_MS6UZdvv5qy4nujatqINxPvijsD_vwZkm0X2TFTQ"
     ),
-    "REFRESH_TOKEN": "aeABIYvFqQxba8Do8raBOVKVg1uGcEJCv8jKUkl2KAv4N4IFFaZu0YcbBofcpP7G",
+    "REFRESH_TOKEN": (
+        "9KToEk0JKWSCDwOLmfBGdwTLL632PGCDKQrUJ29UtGPR3YIPYGMppf1X8hIWGmwL"
+    ),
     "DEVICE_ID": "97de4f52-6b25-4977-ad4e-5d5481574062",
-    "CUSTOMER_PROFILE_ID": "a3602c49-583c-4b92-9213-bc4ae35fed4f",
-    "CUSTOMER_HASH_EMAIL": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
-    "STRIPE_ORDER_ID": "ec760ddd-e4ee-4c2c-96e3-5010ddf3806d",
+    "CUSTOMER_PROFILE_ID": "",
+    "CUSTOMER_HASH_EMAIL": "",
+    "STRIPE_ORDER_ID": "",
 
-    # ── 💳 Stripe (من السجل #326/#328) ───────────────────────────────────
+    # ── 💳 Stripe (pk فقط) ───────────────────────────────────────────────
     "STRIPE_PUBLISHABLE_KEY": (
         "pk_live_51LVdJtLeiF50tx6reJrhWFBcVdwMfouS1zw0cag4uUNiTKz13hUE9yIRV4LwuJ"
         "MZHUAvxTJT862K0uHENSJ4TF3i00NKSjSaaR"
@@ -74,27 +76,29 @@ _FIXED_CONFIG = {
     "STRIPE_MERCHANT": "acct_1LVdJtLeiF50tx6r",
     "STRIPE_PAYATT": "payatt_3UXrnnLeiF50tx6r11CJI9HE",
 
-    # ── 🇪🇬 مصر — من السجل #117 ──────────────────────────────────────────
+    # ── 🇪🇬 مصر ─────────────────────────────────────────────────────────
     "AUTO_COUNTRY": "EG",
-    "AUTO_RESOLVE": "false",  # معطل — القيم ثابتة
+    "AUTO_RESOLVE": "false",
     "EG_COUNTRY_ID": "6ba74ed8-4287-470b-815a-929295ba5d0b",
     "EG_PRODUCT_ID": "65fdbc27-d0f2-4144-9b16-9c1003711f98",
     "AUTO_CACHE_TTL": "3600",
     "PRODUCTS_TTL": "300",
 
-    # ── 👤 هوية ثابتة ─────────────────────────────────────────────────────
+    # ── 👤 هوية ثابتة ───────────────────────────────────────────────────
     "FIXED_EMAIL": "john.smith.orders@gmail.com",
     "FIXED_FIRST_NAME": "John",
     "FIXED_LAST_NAME": "Smith",
 
-    # ── 🌐 URLs ───────────────────────────────────────────────────────────
+    # ── 🌐 URLs ──────────────────────────────────────────────────────────
     "BASE_URL": "https://play.prod.yomobile.xyz",
     "STORE_URL": "https://www.globalyo.com",
     "STRIPE_URL": "https://api.stripe.com",
 
-    # ── ⚙️ الأداء ─────────────────────────────────────────────────────────
+    # ── ⚙️ الأداء + التجديد ─────────────────────────────────────────────
     "USE_STORE_PROXY": "true",
     "SESSION_TTL": "900",
+    "SESSION_REFRESH_MARGIN": "180",   # ⭐ جدّد قبل 180s من الانتهاء
+    "SESSION_LOOP_INTERVAL": "60",     # ⭐ افحص كل 60s
     "REQUEST_TIMEOUT": "60",
     "RETRY_COUNT": "2",
     "RETRY_DELAY": "1.0",
@@ -102,12 +106,12 @@ _FIXED_CONFIG = {
     "MAX_CONCURRENCY": "100",
     "BATCH_CONCURRENCY": "5",
 
-    # ── 🔌 بروكسي ─────────────────────────────────────────────────────────
+    # ── 🔌 بروكسي ────────────────────────────────────────────────────────
     "PROXY_FILE": "",
     "CB_THRESHOLD": "5",
     "CB_COOLDOWN": "300",
 
-    # ── 📝 مخرجات ─────────────────────────────────────────────────────────
+    # ── 📝 مخرجات ────────────────────────────────────────────────────────
     "LOG_LEVEL": "INFO",
     "OUTPUT_DIR": "yo_runs",
     "PORT": "8000",
@@ -123,7 +127,7 @@ def _vb(key: str, default: str = "true") -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Config (مشتق)
+# Config
 # ═══════════════════════════════════════════════════════════════════════════
 BASE_URL = _v("BASE_URL")
 STORE_URL = _v("STORE_URL")
@@ -160,18 +164,19 @@ MAX_CONCURRENCY = int(_v("MAX_CONCURRENCY", "100"))
 BATCH_CONCURRENCY = int(_v("BATCH_CONCURRENCY", "5"))
 OUTPUT_DIR = _v("OUTPUT_DIR", "yo_runs")
 SESSION_TTL = float(_v("SESSION_TTL", "900"))
+SESSION_REFRESH_MARGIN = int(_v("SESSION_REFRESH_MARGIN", "180"))
+SESSION_LOOP_INTERVAL = int(_v("SESSION_LOOP_INTERVAL", "60"))
 
-# Legacy placeholders (التوافق فقط)
 AUTH_BEARER = ""
 STRIPE_AUTH = ""
 FIREBASE_APP_CHECK = ""
 APP_ATTESTATION = "valid"
 STRIPE_CUSTOMER_ID = ""
 STRIPE_PAYMENT_INTENT_SECRET = ""
-ESIM_ORDER_ID = _v("STRIPE_ORDER_ID")
+ESIM_ORDER_ID = ""
 ESIM_PRODUCT_ID = EG_PRODUCT_ID
 ESIM_COUNTRY_ID = EG_COUNTRY_ID
-DEVICE_ID = _v("DEVICE_ID")
+DEVICE_ID = ""
 CUSTOMER_EMAIL = ""
 CUSTOMER_FIRST_NAME = ""
 CUSTOMER_LAST_NAME = ""
@@ -180,7 +185,44 @@ API_KEY = ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Address book (مصر أولاً)
+# ⭐ JWT utilities — قراءة exp بدون تحقق من التوقيع
+# ═══════════════════════════════════════════════════════════════════════════
+def _jwt_exp(token: str) -> Optional[int]:
+    """استخراج exp claim من JWT (بدون تحقق)."""
+    if not token:
+        return None
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        payload_b64 = parts[1]
+        padding = "=" * (4 - len(payload_b64) % 4)
+        decoded = base64.urlsafe_b64decode(payload_b64 + padding)
+        payload = json.loads(decoded)
+        exp = payload.get("exp")
+        return int(exp) if exp else None
+    except Exception:
+        return None
+
+
+def _jwt_remaining(token: str) -> int:
+    """ثواني متبقية قبل انتهاء التوكن (0 إذا منتهي)."""
+    exp = _jwt_exp(token)
+    if not exp:
+        return 0
+    return max(0, exp - int(time.time()))
+
+
+def _jwt_is_valid(token: str, margin_sec: int = 120) -> bool:
+    """هل التوكن صالح مع هامش أمان؟"""
+    exp = _jwt_exp(token)
+    if not exp:
+        return False
+    return time.time() + margin_sec < exp
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Address book
 # ═══════════════════════════════════════════════════════════════════════════
 ADDRESS_BOOK: Dict[str, List[Dict[str, str]]] = {
     "EG": [
@@ -195,14 +237,8 @@ ADDRESS_BOOK: Dict[str, List[Dict[str, str]]] = {
     "GB": [
         {"address1": "221B Baker Street", "city": "London", "state": "ENG", "postal_code": "NW1 6XE", "country": "GB", "phone": "2079460123"},
     ],
-    "CA": [
-        {"address1": "88 Queen St W", "city": "Toronto", "state": "ON", "postal_code": "M5H 2M4", "country": "CA", "phone": "4165550198"},
-    ],
     "AE": [
         {"address1": "Burj Khalifa Tower", "city": "Dubai", "state": "DU", "postal_code": "00000", "country": "AE", "phone": "97143231234"},
-    ],
-    "SA": [
-        {"address1": "King Fahd Road", "city": "Riyadh", "state": "RD", "postal_code": "11564", "country": "SA", "phone": "966112345678"},
     ],
     "DEFAULT": [
         {"address1": "15 Nile Corniche", "city": "Cairo", "state": "C", "postal_code": "11511", "country": "EG", "phone": "20225755000"},
@@ -217,9 +253,9 @@ def _detect_country_from_card(card_number: str) -> str:
     if prefix4 in {"4000", "4001", "4002", "4003", "4004", "4005"}:
         return "GB"
     if prefix4 in {"4500", "4501", "4502", "4503", "4504", "4505"}:
-        return "CA"
+        return "US"
     if prefix4 in {"5100", "5101", "5102", "5103", "5104", "5105"}:
-        return "AU"
+        return "US"
     return "EG"
 
 
@@ -267,7 +303,7 @@ def _check_auth(request: Optional[Request]) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Headers (من السجل)
+# Headers
 # ═══════════════════════════════════════════════════════════════════════════
 WEB_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.2 Mobile/15E148 Safari/604.1"
 IOS_UA = "Global YO/5.6.0 (com.yoverse.core; build:1612; iOS 27.2.0) Alamofire/5.12.0"
@@ -302,6 +338,7 @@ _METRICS = Counter({
     "total": 0, "success": 0, "failed": 0,
     "runs": 0, "single_runs": 0, "proxy_errors": 0,
     "session_refresh": 0, "session_fail": 0,
+    "session_401_retry": 0,
     "stripe_tokenize_ok": 0, "stripe_tokenize_fail": 0,
     "payment_tok": 0, "payment_pm": 0, "payment_sheet": 0,
 })
@@ -590,7 +627,7 @@ def _order_id_from_body(body: Any) -> Optional[str]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Session Manager
+# Session Manager (JWT-aware)
 # ═══════════════════════════════════════════════════════════════════════════
 class SessionManager:
     def __init__(self):
@@ -601,10 +638,17 @@ class SessionManager:
         self.customer_hash_email: str = ""
         self.stripe_order_id: str = ""
         self.updated_at: float = 0.0
+        self.last_refresh_attempt: float = 0.0
         self.lock = asyncio.Lock()
 
     def is_fresh(self) -> bool:
-        return bool(self.auth_token) and (time.time() - self.updated_at) < SESSION_TTL
+        """يعتمد على exp الحقيقي للـ JWT مع هامش أمان."""
+        if not self.auth_token:
+            return False
+        return _jwt_is_valid(self.auth_token, margin_sec=SESSION_REFRESH_MARGIN)
+
+    def token_remaining(self) -> int:
+        return _jwt_remaining(self.auth_token) if self.auth_token else 0
 
     def cookie_header(self, extra: Optional[Dict[str, str]] = None) -> str:
         parts: List[str] = []
@@ -639,6 +683,11 @@ class SessionManager:
         if order_id:
             self.stripe_order_id = order_id
 
+    def invalidate(self) -> None:
+        """إبطال التوكن لإجبار تجديده."""
+        self.auth_token = ""
+        self.updated_at = 0.0
+
 
 _session = SessionManager()
 
@@ -655,22 +704,41 @@ async def _init_session_from_config() -> None:
         _session.updated_at = time.time() if _session.auth_token else 0.0
 
     if _session.auth_token:
+        remaining = _jwt_remaining(_session.auth_token)
+        exp = _jwt_exp(_session.auth_token)
         logger.info(
             f"[SESSION] loaded from config: auth=yes | "
             f"device={_session.device_id[:8]}... | "
-            f"profile={'yes' if _session.customer_profile_id else 'no'} | "
-            f"stripe_order={( _session.stripe_order_id[:12] + '...') if _session.stripe_order_id else 'no'}"
+            f"exp_remaining={remaining}s | "
+            f"has_refresh={'yes' if _session.refresh_token else 'no'}"
         )
+        if remaining <= 0:
+            logger.warning("[SESSION] ⚠️ AUTH_TOKEN منتهي! سيجدد عبر refresh_token تلقائيًا")
     else:
-        logger.warning("[SESSION] AUTH_TOKEN فارغ — لن تستطيع إنشاء order")
+        logger.warning(
+            "[SESSION] AUTH_TOKEN فارغ — عدّله في _FIXED_CONFIG['AUTH_TOKEN']"
+        )
 
 
 async def _fetch_session(
     client: httpx.AsyncClient,
     cookie_header: str = "",
+    force: bool = False,
 ) -> Tuple[bool, str]:
+    """
+    تجديد الجلسة عبر /api/storefront/auth/session.
+    يتحقق فعليًا من أن التوكن الجديد مختلف وصالح.
+    """
     if not USE_STORE_PROXY:
         return True, ""
+
+    # منع المحاولات المتكررة في وقت قصير جدًا
+    now = time.time()
+    if not force and (now - _session.last_refresh_attempt) < 5:
+        return _session.is_fresh(), "throttled"
+
+    _session.last_refresh_attempt = now
+
     url = f"{STORE_URL}/api/storefront/auth/session"
     headers = dict(WEB_HEADERS)
     headers["Pragma"] = "no-cache"
@@ -680,40 +748,71 @@ async def _fetch_session(
     headers["Sec-Fetch-Dest"] = "empty"
     if cookie_header:
         headers["Cookie"] = cookie_header
+
+    old_token = _session.auth_token
+    old_hash = hashlib.sha256(old_token.encode()).hexdigest()[:16] if old_token else ""
+
     try:
         resp = await client.get(url, headers=headers)
         if resp.status_code not in (200, 201):
             async with _METRICS_LOCK:
                 _METRICS["session_fail"] += 1
+            logger.warning(f"[SESSION] refresh HTTP {resp.status_code}")
             return False, f"HTTP {resp.status_code}"
+
         cookies = _extract_response_cookies(resp)
-        if cookies:
-            _session.update_from_cookies(cookies)
+        if not cookies:
             async with _METRICS_LOCK:
-                _METRICS["session_refresh"] += 1
-            logger.info(f"[SESSION] refreshed: auth={'yes' if _session.auth_token else 'no'}")
-            return True, ""
-        return False, "no cookies"
+                _METRICS["session_fail"] += 1
+            return False, "no cookies in response"
+
+        _session.update_from_cookies(cookies)
+
+        new_token = _session.auth_token
+        new_hash = hashlib.sha256(new_token.encode()).hexdigest()[:16] if new_token else ""
+
+        # تحقق 1: هل تغيّر التوكن؟
+        if old_hash and new_hash == old_hash:
+            logger.warning(f"[SESSION] server returned SAME token (hash={new_hash})")
+            return False, "same token returned"
+
+        # تحقق 2: هل التوكن الجديد صالح؟
+        if not _jwt_is_valid(new_token, margin_sec=30):
+            remaining = _jwt_remaining(new_token)
+            logger.warning(f"[SESSION] new token still expired! (remaining={remaining}s)")
+            return False, "new token expired"
+
+        remaining = _jwt_remaining(new_token)
+        async with _METRICS_LOCK:
+            _METRICS["session_refresh"] += 1
+        logger.info(f"[SESSION] ✅ refreshed | hash={new_hash} | remaining={remaining}s")
+        return True, ""
+
     except Exception as e:
         async with _METRICS_LOCK:
             _METRICS["session_fail"] += 1
         return False, f"{type(e).__name__}: {str(e)[:80]}"
 
 
-async def _ensure_session(client: httpx.AsyncClient) -> bool:
+async def _ensure_session(client: httpx.AsyncClient, force: bool = False) -> bool:
+    """ضمان جلسة صالحة (مع تجديد استباقي)."""
     if not USE_STORE_PROXY:
         return True
     async with _session.lock:
-        if _session.is_fresh():
+        if not force and _session.is_fresh():
             return True
-        ok, err = await _fetch_session(client, cookie_header=_session.cookie_header())
+        ok, err = await _fetch_session(
+            client,
+            cookie_header=_session.cookie_header(),
+            force=force,
+        )
         if not ok:
-            logger.warning(f"[SESSION] refresh failed: {err}")
+            logger.warning(f"[SESSION] ensure failed: {err}")
         return ok
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Stripe Tokenization بـ pk (بدون sk)
+# Stripe Tokenization بـ pk
 # ═══════════════════════════════════════════════════════════════════════════
 async def stripe_tokenize_pk(
     client: httpx.AsyncClient,
@@ -769,176 +868,7 @@ async def stripe_tokenize_pk(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Auto-Resolver (احتياطي — معطل لأن القيم ثابتة في السجل)
-# ═══════════════════════════════════════════════════════════════════════════
-_ISO_TO_NAMES: Dict[str, List[str]] = {
-    "EG": ["egypt", "مصر"], "US": ["united states", "usa"],
-    "GB": ["united kingdom", "uk", "britain"], "CA": ["canada"],
-    "AE": ["united arab emirates", "uae"], "SA": ["saudi arabia"],
-}
-
-_countries_cache: Dict[str, Any] = {"ts": 0.0, "by_iso": {}, "all": []}
-_products_cache: Dict[str, Dict[str, Any]] = {}
-_auto_lock = asyncio.Lock()
-
-
-async def _fetch_countries(client: httpx.AsyncClient) -> Optional[List[Dict[str, Any]]]:
-    url = f"{BASE_URL}/api/v1.0/esim/countries/"
-    headers = dict(BASE_HEADERS)
-    headers["X-Request-ID"] = str(uuid.uuid4())
-    try:
-        resp = await client.get(url, headers=headers)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            for key in ("results", "countries", "data"):
-                if isinstance(data.get(key), list):
-                    return data[key]
-        return None
-    except Exception:
-        return None
-
-
-def _pick_country_id(c: Dict[str, Any]) -> Optional[str]:
-    for key in ("id", "uuid", "country_id"):
-        v = c.get(key)
-        if isinstance(v, str) and v:
-            return v
-    return None
-
-
-def _country_matches(c: Dict[str, Any], iso: str) -> bool:
-    iso_u = iso.upper()
-    for field in ("iso_code", "iso2", "country_code", "code"):
-        if str(c.get(field, "")).upper() == iso_u:
-            return True
-    aliases = _ISO_TO_NAMES.get(iso_u, [iso_u.lower()])
-    names = [
-        str(c.get("name", "")).lower(),
-        str(c.get("name_en", "")).lower(),
-    ]
-    for a in aliases:
-        for n in names:
-            if n and a in n:
-                return True
-    return False
-
-
-async def _fetch_products(client: httpx.AsyncClient, country_id: str) -> Optional[List[Dict[str, Any]]]:
-    for version in ("v5.0", "v1.0"):
-        url = f"{BASE_URL}/api/{version}/esim/countries/{country_id}/products/"
-        headers = dict(BASE_HEADERS)
-        headers["X-Request-ID"] = str(uuid.uuid4())
-        try:
-            resp = await client.get(url, headers=headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, list):
-                    return data
-                if isinstance(data, dict):
-                    for key in ("results", "products", "plans"):
-                        if isinstance(data.get(key), list):
-                            return data[key]
-        except Exception:
-            continue
-    return None
-
-
-def _product_price(p: Dict[str, Any]) -> float:
-    for f in ("price", "amount", "retail_price"):
-        v = p.get(f)
-        if isinstance(v, (int, float)):
-            return float(v)
-        if isinstance(v, str):
-            try:
-                return float(v.replace(",", "").strip())
-            except ValueError:
-                pass
-    return float("inf")
-
-
-def _product_id(p: Dict[str, Any]) -> Optional[str]:
-    for k in ("id", "uuid", "product_id", "plan_id"):
-        v = p.get(k)
-        if isinstance(v, str) and v:
-            return v
-    return None
-
-
-async def _auto_resolve_esim(
-    country_code: Optional[str] = None,
-    force_refresh: bool = False,
-) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, Any]],
-           Optional[Dict[str, Any]], Optional[str]]:
-    iso = (country_code or AUTO_COUNTRY or "EG").upper()
-    client = await _get_client()
-
-    # Country
-    async with _auto_lock:
-        now = time.time()
-        if force_refresh or (now - _countries_cache["ts"]) > AUTO_CACHE_TTL \
-           or not _countries_cache["all"]:
-            countries = await _fetch_countries(client)
-            if not countries:
-                return None, None, None, None, "failed to fetch countries"
-            by_iso: Dict[str, Any] = {}
-            for c in countries:
-                if not isinstance(c, dict):
-                    continue
-                cid = _pick_country_id(c)
-                if not cid:
-                    continue
-                for field in ("iso_code", "iso2", "country_code", "code"):
-                    v = str(c.get(field, "")).upper()
-                    if v and v not in by_iso:
-                        by_iso[v] = {"id": cid, "raw": c}
-            _countries_cache["ts"] = now
-            _countries_cache["all"] = countries
-            _countries_cache["by_iso"] = by_iso
-
-        entry = _countries_cache["by_iso"].get(iso)
-        if entry:
-            country_id = entry["id"]
-            country_raw = entry.get("raw")
-        else:
-            for c in _countries_cache["all"]:
-                if isinstance(c, dict) and _country_matches(c, iso):
-                    cid = _pick_country_id(c)
-                    if cid:
-                        country_id = cid
-                        country_raw = c
-                        break
-            else:
-                return None, None, None, None, f"country '{iso}' not found"
-
-    # Products
-    now = time.time()
-    cached = _products_cache.get(country_id)
-    if not force_refresh and cached and (now - cached["ts"]) < PRODUCTS_TTL:
-        products = cached["products"]
-    else:
-        products = await _fetch_products(client, country_id)
-        if not products:
-            return country_id, None, None, country_raw, f"no products for {iso}"
-        _products_cache[country_id] = {"ts": now, "products": products}
-
-    candidates = [
-        {"id": _product_id(p), "price": _product_price(p), "raw": p}
-        for p in products
-        if isinstance(p, dict) and _product_id(p)
-    ]
-    if not candidates:
-        return country_id, None, None, country_raw, "no valid products"
-    candidates.sort(key=lambda x: x["price"])
-    best = candidates[0]
-    return country_id, best["id"], best["raw"], country_raw, None
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# YoQuery
+# YoQuery (308 fix)
 # ═══════════════════════════════════════════════════════════════════════════
 @dataclass(frozen=True)
 class YoQuery:
@@ -961,6 +891,9 @@ class YoQuery:
         if self.via_store_proxy and USE_STORE_PROXY:
             store = ctx.get("store_url") or STORE_URL
             p = self.path if self.path.startswith("/") else "/" + self.path
+            # إزالة trailing slash لمنع 308 redirect
+            if len(p) > 1 and p.endswith("/"):
+                p = p.rstrip("/")
             return f"{store}/api/storefront/proxy{p}"
         base = ctx["base_url"]
         return self.path if self.path.startswith("http") else base + self.path
@@ -1003,7 +936,7 @@ class YoQuery:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# build_queries (يستخدم القيم الثابتة من السجل)
+# build_queries
 # ═══════════════════════════════════════════════════════════════════════════
 def build_queries(
     overrides: Optional[Dict[str, str]] = None,
@@ -1040,7 +973,6 @@ def build_queries(
     bill_line1 = addr.get("address1", "")
 
     return [
-        # Public
         YoQuery("dinero_event_52", "GET", "/api/v1.0/dinero/events/52/"),
         YoQuery("esim_regions", "GET", "/api/v1.0/esim/regions/"),
         YoQuery("esim_countries", "GET", "/api/v1.0/esim/countries/"),
@@ -1054,7 +986,6 @@ def build_queries(
         YoQuery("dinero_multipliers", "GET", "/api/v1.0/dinero/multipliers/"),
         YoQuery("esim_all_countries", "GET", "/api/v1.0/esim/all-countries/"),
 
-        # Auth via proxy
         YoQuery("sync_current", "GET", "/api/v1.0/sync/current/",
                 needs_auth=True, via_store_proxy=True),
         YoQuery("social_friends", "GET", "/api/v1.0/social/friends/",
@@ -1074,13 +1005,11 @@ def build_queries(
         YoQuery("esim_subscriber", "GET", "/api/v1.0/esim/subscriber/",
                 needs_auth=True, via_store_proxy=True),
 
-        # Egypt
         YoQuery("esim_products_eg", "GET",
                 f"/api/v5.0/esim/countries/{country_id}/products/"),
         YoQuery("esim_supported_nets", "GET",
                 f"/api/v1.0/esim/products/{product_id}/supported-networks/"),
 
-        # Order flow
         YoQuery("esim_order_create", "POST", "/api/v1.0/esim/orders/",
                 needs_auth=True, destructive=True, via_store_proxy=True, json_body={
             "subscriber": {
@@ -1191,7 +1120,7 @@ def _extract_overrides(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# execute_query
+# execute_query — مع retry تلقائي عند 401
 # ═══════════════════════════════════════════════════════════════════════════
 async def execute_query(
     q: YoQuery,
@@ -1216,6 +1145,7 @@ async def execute_query(
     last_proxy: Optional[str] = None
     attempts = 0
     elapsed_ms = 0
+    auth_retried = False  # منع حلقة لا نهائية
 
     for attempt in range(retry + 1):
         attempts = attempt + 1
@@ -1241,6 +1171,19 @@ async def execute_query(
                 data=q.form_body,
             )
             elapsed_ms = int((time.time() - started) * 1000)
+
+            # ⭐ عند 401 → أعد التجديد وأعد المحاولة مرة واحدة
+            if resp.status_code == 401 and q.via_store_proxy and not auth_retried:
+                auth_retried = True
+                async with _METRICS_LOCK:
+                    _METRICS["session_401_retry"] += 1
+                logger.warning(f"[401] {q.name} → forcing refresh + retry")
+                _session.invalidate()
+                ok = await _ensure_session(client, force=True)
+                if ok:
+                    await asyncio.sleep(0.5)
+                    attempts -= 1
+                    continue
 
             new_cookies = _extract_response_cookies(resp)
             if new_cookies:
@@ -1667,11 +1610,12 @@ def classify_yo_response(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Lifespan + cleanup
+# Lifespan + cleanup + refresh loop
 # ═══════════════════════════════════════════════════════════════════════════
 _proxy_cb: Optional[ProxyCircuitBreaker] = None
 _proxy_rotator: Optional[ProxyRotator] = None
 _cleanup_task: Optional[asyncio.Task] = None
+_refresh_task: Optional[asyncio.Task] = None  # ⭐ v1.9.0
 
 
 async def _periodic_cleanup():
@@ -1680,55 +1624,102 @@ async def _periodic_cleanup():
             await asyncio.sleep(120)
             if _proxy_rotator:
                 await _proxy_rotator.cleanup_stale(max_age=300)
-            if _session.auth_token and (time.time() - _session.updated_at) > SESSION_TTL * 2:
-                logger.info("[SESSION] stale — will refresh on next request")
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.debug(f"cleanup error: {e}")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# ⭐ v1.9.0: Background session refresh loop (كل 60 ثانية)
+# ═══════════════════════════════════════════════════════════════════════════
+async def _session_refresh_loop():
+    """
+    تجديد استباقي لـ auth_token قبل انتهائه.
+    - كل 60 ثانية: يفحص الوقت المتبقي
+    - إذا < 180 ثانية: يجدد فورًا
+    """
+    await asyncio.sleep(10)  # تأخير أولي
+    while True:
+        try:
+            await asyncio.sleep(SESSION_LOOP_INTERVAL)
+            if not USE_STORE_PROXY:
+                continue
+            if not _session.refresh_token:
+                continue
+
+            remaining = _session.token_remaining()
+
+            # إذا لا يوجد auth_token، أو متبقٍ أقل من SESSION_REFRESH_MARGIN
+            if not _session.auth_token or remaining < SESSION_REFRESH_MARGIN:
+                logger.info(
+                    f"[REFRESH-LOOP] auth_token remaining={remaining}s → refreshing proactively"
+                )
+                client = await _get_client()
+                ok = await _ensure_session(client, force=True)
+                if ok:
+                    new_remaining = _session.token_remaining()
+                    logger.info(f"[REFRESH-LOOP] ✅ new token | remaining={new_remaining}s")
+                else:
+                    logger.warning(f"[REFRESH-LOOP] ❌ refresh failed")
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.debug(f"[REFRESH-LOOP] error: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _proxy_cb, _proxy_rotator, _cleanup_task
+    global _proxy_cb, _proxy_rotator, _cleanup_task, _refresh_task
 
-    # تحميل الجلسة من _FIXED_CONFIG
+    # 1. تحميل الجلسة من _FIXED_CONFIG
     await _init_session_from_config()
 
+    # 2. تهيئة البروكسي
     proxies = _load_proxies(PROXY_FILE) if PROXY_FILE else []
     _proxy_cb = ProxyCircuitBreaker(threshold=CB_THRESHOLD, cooldown=CB_COOLDOWN)
     _proxy_rotator = ProxyRotator(proxies, _proxy_cb, sticky=True)
 
+    # 3. HTTP client
     await _get_client()
-    _cleanup_task = asyncio.create_task(_periodic_cleanup())
+
+    # 4. المهام الخلفية (لا تعمل على Vercel Serverless)
+    if not os.environ.get("VERCEL"):
+        _cleanup_task = asyncio.create_task(_periodic_cleanup())
+        _refresh_task = asyncio.create_task(_session_refresh_loop())  # ⭐
 
     logger.info(
-        "[STARTUP] v1.7.0 | base=%s | store=%s | country=%s | auth=%s | stripe_pk=%s",
+        "[STARTUP] v1.9.0 | base=%s | store=%s | country=%s | auth=%s | remaining=%ds | refresh_loop=%s | stripe_pk=%s",
         BASE_URL, STORE_URL, AUTO_COUNTRY,
         "yes" if _session.auth_token else "MISSING",
+        _session.token_remaining(),
+        "on" if not os.environ.get("VERCEL") else "off",
         "yes" if STRIPE_PUBLISHABLE_KEY else "no",
     )
 
-    # محاولة تجديد الجلسة
-    if USE_STORE_PROXY and _session.auth_token:
+    # 5. تجديد فوري إذا الجلسة غير صالحة
+    if USE_STORE_PROXY and _session.refresh_token and not _session.is_fresh():
         try:
             client = await _get_client()
-            ok, err = await _fetch_session(client, cookie_header=_session.cookie_header())
+            ok = await _ensure_session(client, force=True)
             if ok:
-                logger.info("[SESSION] refreshed from log")
+                logger.info(f"[STARTUP] ✅ initial refresh OK | remaining={_session.token_remaining()}s")
             else:
-                logger.warning(f"[SESSION] refresh failed: {err} — using saved token (may be expired)")
+                logger.warning("[STARTUP] ⚠️ initial refresh failed — using saved token")
         except Exception as e:
-            logger.warning(f"[SESSION] exception: {e}")
+            logger.warning(f"[STARTUP] initial refresh exception: {e}")
 
     yield
 
-    if _cleanup_task:
-        _cleanup_task.cancel()
-        try:
-            await _cleanup_task
-        except (asyncio.CancelledError, Exception):
-            pass
+    # 6. إغلاق
+    for task in (_cleanup_task, _refresh_task):
+        if task:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     await _close_client()
     logger.info("[SHUTDOWN] stopped")
@@ -1739,8 +1730,8 @@ async def lifespan(app: FastAPI):
 # ═══════════════════════════════════════════════════════════════════════════
 app = FastAPI(
     title="Yomobile API Runner",
-    version="1.7.0",
-    description="Yomobile + Egypt + pk tokenization (no sk)",
+    version="1.9.0",
+    description="JWT-aware auto-refresh | Egypt + pk + 308-fix",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url=None,
@@ -1748,7 +1739,7 @@ app = FastAPI(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# _run_yo_flow — 3 استراتيجيات دفع
+# _run_yo_flow
 # ═══════════════════════════════════════════════════════════════════════════
 async def _run_yo_flow(
     card_str: str,
@@ -1787,7 +1778,7 @@ async def _run_yo_flow(
                         or ESIM_ORDER_ID)
 
     try:
-        # ── 1) إنشاء order ─────────────────────────────────────────────
+        # 1) إنشاء order
         if create_order and "esim_order_create" in by_name:
             r = await execute_query(
                 by_name["esim_order_create"], ctx, _proxy_rotator, _proxy_cb,
@@ -1810,7 +1801,7 @@ async def _run_yo_flow(
                     queries = build_queries(overrides, card_data=card_data, address=address)
                     by_name = {q.name: q for q in queries}
 
-        # ── 2) الدفع ───────────────────────────────────────────────────
+        # 2) الدفع — 3 استراتيجيات
         if final_code is None and card_data:
             # 2a) tokenize البطاقة عبر pk
             tok, tok_err = None, None
@@ -1829,7 +1820,7 @@ async def _run_yo_flow(
                         "error": tok_err,
                     })
 
-            # 2b) wallet_payment_direct مع tok (البطاقة المخصصة)
+            # 2b) wallet_payment_direct مع tok
             if tok and "wallet_payment_direct" in by_name:
                 _wp = by_name["wallet_payment_direct"]
                 _direct_q = YoQuery(
@@ -1861,7 +1852,7 @@ async def _run_yo_flow(
                 else:
                     final_code = _extract_error_code(r.get("body")) or "CARD_DECLINED"
 
-            # 2c) wallet_payment_direct مع pm المحفوظ من السجل
+            # 2c) wallet_payment_direct مع pm
             if final_code is None and "wallet_payment_direct" in by_name and STRIPE_PAYMENT_METHOD_ID:
                 r = await execute_query(
                     by_name["wallet_payment_direct"], ctx,
@@ -1941,7 +1932,7 @@ async def root():
     proxies_count = len(_proxy_rotator.proxies) if _proxy_rotator else 0
     return {
         "service": "yomobile-runner",
-        "version": "1.7.0",
+        "version": "1.9.0",
         "base_url": BASE_URL,
         "store_url": STORE_URL,
         "stripe_url": STRIPE_URL,
@@ -1951,15 +1942,18 @@ async def root():
             "country_id": EG_COUNTRY_ID,
             "product_id": EG_PRODUCT_ID,
         },
-        "stripe": {
-            "publishable_key_prefix": STRIPE_PUBLISHABLE_KEY[:12] + "..." if STRIPE_PUBLISHABLE_KEY else None,
-            "payment_method_id": STRIPE_PAYMENT_METHOD_ID[:12] + "..." if STRIPE_PAYMENT_METHOD_ID else None,
-        },
         "session": {
             "has_auth_token": bool(_session.auth_token),
             "has_refresh_token": bool(_session.refresh_token),
             "device_id_prefix": _session.device_id[:8] + "..." if _session.device_id else None,
             "stripe_order_id": _session.stripe_order_id or None,
+            "token_remaining_sec": _session.token_remaining(),
+            "is_fresh": _session.is_fresh(),
+        },
+        "refresh_loop": {
+            "enabled": _refresh_task is not None and not _refresh_task.done(),
+            "interval_sec": SESSION_LOOP_INTERVAL,
+            "margin_sec": SESSION_REFRESH_MARGIN,
         },
         "queries_count": len(build_queries()),
         "proxy_pool_size": proxies_count,
@@ -1971,6 +1965,7 @@ async def root():
             "POST /batch {cards: [...]}",
             "GET  /esim/egypt",
             "GET  /session/status",
+            "GET  /session/refresh",
         ],
     }
 
@@ -1981,6 +1976,7 @@ async def root():
 @app.get("/session/status")
 async def session_status(request: Request):
     _check_auth(request)
+    exp = _jwt_exp(_session.auth_token) if _session.auth_token else None
     return JSONResponse(content={
         "has_auth_token": bool(_session.auth_token),
         "has_refresh_token": bool(_session.refresh_token),
@@ -1988,24 +1984,34 @@ async def session_status(request: Request):
         "has_stripe_order_id": bool(_session.stripe_order_id),
         "customer_profile_id": _session.customer_profile_id or None,
         "stripe_order_id": _session.stripe_order_id or None,
-        "fresh": _session.is_fresh(),
-        "age_sec": int(time.time() - _session.updated_at) if _session.updated_at else None,
-        "ttl_sec": int(SESSION_TTL),
+        "is_fresh": _session.is_fresh(),
+        "token_remaining_sec": _session.token_remaining(),
+        "token_exp_unix": exp,
+        "refresh_margin_sec": SESSION_REFRESH_MARGIN,
+        "refresh_loop_running": _refresh_task is not None and not _refresh_task.done(),
+        "last_refresh_attempt_ago_sec": (
+            int(time.time() - _session.last_refresh_attempt)
+            if _session.last_refresh_attempt else None
+        ),
         "proxy_mode": USE_STORE_PROXY,
     })
 
 
 @app.get("/session/refresh")
-async def session_refresh(request: Request):
+async def session_refresh(request: Request, force: bool = FastQuery(True)):
     _check_auth(request)
     client = await _get_client()
-    ok, err = await _fetch_session(client, cookie_header=_session.cookie_header())
+    ok, err = await _fetch_session(
+        client,
+        cookie_header=_session.cookie_header(),
+        force=force,
+    )
     return JSONResponse(content={
         "ok": ok,
         "error": err or None,
         "has_auth_token": bool(_session.auth_token),
-        "has_stripe_order_id": bool(_session.stripe_order_id),
-        "stripe_order_id": _session.stripe_order_id or None,
+        "token_remaining_sec": _session.token_remaining(),
+        "is_fresh": _session.is_fresh(),
     }, status_code=200 if ok else 500)
 
 
@@ -2037,7 +2043,7 @@ async def esim_egypt(request: Request):
         "country": "EG",
         "country_id": EG_COUNTRY_ID,
         "product_id": EG_PRODUCT_ID,
-        "source": "hardcoded from log",
+        "source": "hardcoded",
     })
 
 
@@ -2056,93 +2062,27 @@ async def esim_resolve(
             "product_id": EG_PRODUCT_ID,
             "source": "hardcoded",
         })
-    cid, pid, praw, craw, err = await _auto_resolve_esim(
-        country_code=country, force_refresh=refresh,
+    return JSONResponse(
+        status_code=404,
+        content={"ok": False, "error": "only EG supported in v1.9.0"},
     )
-    if err:
-        return JSONResponse(
-            status_code=404,
-            content={"ok": False, "country": country.upper(), "error": err},
-        )
-    return JSONResponse(content={
-        "ok": True,
-        "country": country.upper(),
-        "country_id": cid,
-        "product_id": pid,
-        "product": praw,
-        "country_info": craw,
-    })
-
-
-@app.get("/esim/countries")
-async def esim_countries(
-    request: Request,
-    refresh: bool = FastQuery(False),
-):
-    _check_auth(request)
-    client = await _get_client()
-    now = time.time()
-    if refresh or not _countries_cache["all"] \
-       or (now - _countries_cache["ts"]) > AUTO_CACHE_TTL:
-        countries = await _fetch_countries(client)
-        if not countries:
-            raise HTTPException(status_code=503, detail="Failed to fetch countries")
-        _countries_cache["all"] = countries
-        _countries_cache["ts"] = now
-    return JSONResponse(content={
-        "total": len(_countries_cache["all"]),
-        "countries": _countries_cache["all"],
-    })
-
-
-@app.get("/esim/products/{country_id}")
-async def esim_products(
-    country_id: str,
-    request: Request,
-    refresh: bool = FastQuery(False),
-):
-    _check_auth(request)
-    client = await _get_client()
-    now = time.time()
-    cached = _products_cache.get(country_id)
-    if not refresh and cached and (now - cached["ts"]) < PRODUCTS_TTL:
-        products = cached["products"]
-    else:
-        products = await _fetch_products(client, country_id)
-        if not products:
-            raise HTTPException(status_code=404,
-                                detail=f"No products for country_id={country_id}")
-        _products_cache[country_id] = {"ts": now, "products": products}
-    sorted_p = sorted(
-        [p for p in products if isinstance(p, dict)],
-        key=lambda p: _product_price(p),
-    )
-    return JSONResponse(content={
-        "country_id": country_id,
-        "total": len(sorted_p),
-        "products": sorted_p,
-    })
 
 
 @app.get("/esim/cache/clear")
 async def esim_cache_clear(request: Request):
     _check_auth(request)
-    _countries_cache["ts"] = 0.0
-    _countries_cache["by_iso"] = {}
-    _countries_cache["all"] = []
-    _products_cache.clear()
-    return JSONResponse(content={"ok": True, "message": "caches cleared"})
+    return JSONResponse(content={"ok": True, "message": "no cache in v1.9.0"})
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# GET /yo — main endpoint
+# GET /yo
 # ═══════════════════════════════════════════════════════════════════════════
 @app.get("/yo")
 async def yo_direct(
     request: Request,
     cc: str = FastQuery(..., description="Card: CC|MM|YYYY|CVV"),
     proxy: Optional[str] = FastQuery(None),
-    country: Optional[str] = FastQuery(None, description="Billing ISO (default=EG)"),
+    country: Optional[str] = FastQuery(None),
     payment_method: str = FastQuery("stripe", description="sheet|direct|stripe"),
     create_order: bool = FastQuery(True),
     price: float = FastQuery(10.0),
@@ -2523,7 +2463,7 @@ async def yo_batch(request: Request):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# /batch — main77-compatible
+# /batch
 # ═══════════════════════════════════════════════════════════════════════════
 @app.post("/batch")
 async def main77_batch(request: Request):
@@ -2606,13 +2546,13 @@ async def main77_batch(request: Request):
 @app.get("/delcache")
 async def delcache_get(request: Request):
     _check_auth(request)
-    return JSONResponse(content={"status": "success", "cleared": 0, "note": "no variant cache"})
+    return JSONResponse(content={"status": "success", "cleared": 0, "note": "no cache"})
 
 
 @app.post("/delcache")
 async def delcache_post(request: Request):
     _check_auth(request)
-    return JSONResponse(content={"status": "success", "cleared": 0, "note": "no variant cache"})
+    return JSONResponse(content={"status": "success", "cleared": 0, "note": "no cache"})
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2636,6 +2576,8 @@ async def metrics_endpoint(request: Request):
         snapshot["success_pct"] = round(snapshot.get("success", 0) * 100.0 / total, 2)
         snapshot["failed_pct"] = round(snapshot.get("failed", 0) * 100.0 / total, 2)
     snapshot["session_fresh"] = _session.is_fresh()
+    snapshot["session_remaining_sec"] = _session.token_remaining()
+    snapshot["refresh_loop_running"] = _refresh_task is not None and not _refresh_task.done()
     return JSONResponse(content=snapshot)
 
 
@@ -2646,6 +2588,8 @@ async def health_endpoint():
         "proxy_rotator_ready": _proxy_rotator is not None,
         "session_has_auth": bool(_session.auth_token),
         "session_fresh": _session.is_fresh(),
+        "session_remaining_sec": _session.token_remaining(),
+        "refresh_loop_running": _refresh_task is not None and not _refresh_task.done(),
         "stripe_pk_configured": bool(STRIPE_PUBLISHABLE_KEY),
         "egypt_configured": bool(EG_COUNTRY_ID and EG_PRODUCT_ID),
     }
@@ -2665,13 +2609,20 @@ async def health_endpoint():
 async def status_endpoint(request: Request):
     _check_auth(request)
     return JSONResponse(content={
-        "status": "online", "version": "1.7.0",
+        "status": "online", "version": "1.9.0",
         "base_url": BASE_URL, "store_url": STORE_URL,
         "egypt": {"country_id": EG_COUNTRY_ID, "product_id": EG_PRODUCT_ID},
         "session": {
             "has_auth": bool(_session.auth_token),
+            "has_refresh": bool(_session.refresh_token),
             "has_stripe_order": bool(_session.stripe_order_id),
-            "fresh": _session.is_fresh(),
+            "is_fresh": _session.is_fresh(),
+            "token_remaining_sec": _session.token_remaining(),
+        },
+        "refresh_loop": {
+            "running": _refresh_task is not None and not _refresh_task.done(),
+            "interval_sec": SESSION_LOOP_INTERVAL,
+            "margin_sec": SESSION_REFRESH_MARGIN,
         },
         "metrics": dict(_METRICS),
     })
@@ -2746,7 +2697,7 @@ async def proxy_reset(request: Request):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", _v("PORT", "8000")))
     uvicorn.run(
-        "main-yo-api:app",
+        "main:app",
         host="0.0.0.0",
         port=port,
         workers=1,
