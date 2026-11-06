@@ -24,4 +24,4 @@ python -c "import fastapi, uvicorn, httpx; from httpx import HTTPTransport; prin
 
 echo
 log "التثبيت اكتمل"
-echo "  شغّل: source .venv/bin/activate && python main-yo-api.py"
+echo "  شغّل: source .venv/bin/activate && python main.py"
