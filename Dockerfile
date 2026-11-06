@@ -15,7 +15,6 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY main-yo-api.py .
 
-# Fly.io يمرر PORT عبر env — uvicorn يقرأه
 EXPOSE 8000
 
 CMD ["uvicorn", "main-yo-api:app", "--host", "0.0.0.0", "--port", "8000", \
