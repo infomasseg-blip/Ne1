@@ -1,0 +1,30 @@
+app = "yo-api-yourname"
+primary_region = "cdg"   # باريس (قريبة من مصر/أوروبا) — أو "fra" فرانكفورت
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8000"
+  YO_AUTO_COUNTRY = "EG"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = false      # ⭐ لا تُوقف الجهاز — ضروري للمهام الخلفية
+  auto_start_machines = true
+  min_machines_running = 1        # ⭐ أبقِ جهازًا واحدًا يعمل دائمًا
+
+[[vm]]
+  memory = "512mb"                # 256mb قد لا تكفي مع httpx + المهام الخلفية
+  cpu_kind = "shared"
+  cpus = 1
+
+[checks.health]
+  grace_period = "10s"
+  interval = "30s"
+  method = "GET"
+  path = "/health"
+  port = 8000
+  timeout = "5s"
+  type = "http"
